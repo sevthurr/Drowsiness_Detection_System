@@ -224,7 +224,7 @@ class MainWindow(QMainWindow):
             btn_hover = "#00838f"
         
         # Large, bold text for driver visibility
-        msg.setText(f"<h1 style='color:{heading_color}; font-size:26px; margin-bottom:20px;'>Drowsiness Alert Triggered!</h1>")
+        msg.setText(f"<h1 style='color:{heading_color}; font-size:36px; margin-bottom:20px;'>Drowsiness Alert Triggered!</h1>")
         msg.setInformativeText(
             f"<p style='font-size:18px; color:{text_color}; margin-bottom:15px;'>Alert Level: <b>{level}</b></p>"
             f"<p style='font-size:16px; color:{text_color};'>Do you want to acknowledge and turn off the alarm?</p>"

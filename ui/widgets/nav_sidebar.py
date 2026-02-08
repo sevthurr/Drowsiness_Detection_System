@@ -1,11 +1,12 @@
 """Narrow left-side navigation sidebar."""
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSize
 from PySide6.QtWidgets import QPushButton, QVBoxLayout, QWidget
+import qtawesome as qta
 
 
 class NavSidebar(QWidget):
-    """Vertical nav bar with icon-based page-switch buttons."""
+    """Vertical nav bar with Font Awesome icon buttons."""
 
     page_changed = Signal(int)  # 0=Live, 1=Simulator, 2=Settings
 
@@ -18,13 +19,15 @@ class NavSidebar(QWidget):
         lay.setContentsMargins(6, 20, 6, 14)
         lay.setSpacing(8)
 
-        # Icon-based navigation buttons (using Unicode symbols)
-        icons = ["\u25a0", "\u2699", "\u2630"]  # Live (square), Settings (gear), Menu (hamburger)
+        # Font Awesome icons with tooltips
+        icon_names = ["video", "play", "cog"]  # video, gamepad, settings (cog)
         tooltips = ["Live Monitoring", "Simulator", "Settings"]
         self._buttons = []
         
-        for i, (icon, tip) in enumerate(zip(icons, tooltips)):
-            btn = QPushButton(icon)
+        for i, (icon_name, tip) in enumerate(zip(icon_names, tooltips)):
+            btn = QPushButton()
+            btn.setIcon(qta.icon(f"fa5s.{icon_name}", color="white"))
+            btn.setIconSize(QSize(22, 22))
             btn.setObjectName("navBtn")
             btn.setCheckable(True)
             btn.setFixedHeight(48)
