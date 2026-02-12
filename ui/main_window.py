@@ -162,6 +162,11 @@ class MainWindow(QMainWindow):
         if on:
             self.camera.start_capture()
             self.simulator.set_camera_running(True)
+            # Auto-start the simulator engine so alert logic runs
+            if not self.simulator.running:
+                self._last_alert_level = "OK"
+                self._alert_dialog_shown = False
+                self.simulator.start()
         else:
             self.camera.stop_capture()
             self.simulator.set_camera_running(False)
