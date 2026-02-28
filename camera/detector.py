@@ -32,11 +32,12 @@ class CameraDetector(QThread):
 
     Yawn Detection:
     ---------------
-    Uses OTSU thresholding on the histogram-equalized mouth ROI.  OTSU
-    automatically picks the optimal dark/light split within the local region,
-    so it is immune to global face brightness (backlight, dark rooms, etc.).
-    MAR > 8 % + minimum height → mouth open.
-    Mouth must stay open ≥ 2.5 s to register as a yawn, with an 8 s cooldown.
+    Samples the forehead (h*0.04-0.20) as a skin brightness reference — above
+    glasses and unaffected by mouth state.  Pixels in the mouth ROI that are
+    darker than 68 % of the forehead median are marked as "cavity" pixels.
+    MAR = cavity_area / mouth_ROI_area.  MAR ≥ 0.08 + minimum height/width →
+    mouth open.  Mouth must stay open ≥ 2.5 s to register as a yawn, with an
+    8 s cooldown.  2-frame debounce filters single-frame noise.
     """
 
     frame_ready = Signal(QImage)
@@ -62,10 +63,10 @@ class CameraDetector(QThread):
         self._mouth_open_frames  = 0   # consecutive frames with mouth confirmed open
 
         # Calibrated mouth-open thresholds (overridden by reference images if available)
-        self._mar_threshold  = 0.15   # dark-area fraction of mouth region
-        self._min_h_ratio    = 0.22   # min bbox height / mouth_h
-        self._min_w_ratio    = 0.30   # min bbox width  / mouth_w
-        self._min_aspect     = 1.1    # min bbox width  / bbox height
+        self._mar_threshold  = 0.08   # dark-area fraction of mouth region
+        self._min_h_ratio    = 0.15   # min bbox height / mouth_h
+        self._min_w_ratio    = 0.18   # min bbox width  / mouth_w
+        self._min_aspect     = 0.30   # min bbox width  / bbox height (allows tall yawns)
 
         # Run calibration from reference yawn images
         self._calibrate_yawn_thresholds()
@@ -121,13 +122,12 @@ class CameraDetector(QThread):
             face_gray = gray[y:y+h,    x:x+w]
             face_eq   = gray_eq[y:y+h, x:x+w]
 
-            # Same mouth ROI as in run()
+            # Same mouth ROI and reference patch as in run()
             my0 = int(h * 0.60)
             my1 = int(h * 0.92)
-            mx0 = int(w * 0.18)
-            mx1 = int(w * 0.82)
+            mx0 = int(w * 0.20)
+            mx1 = int(w * 0.80)
             mouth_raw = face_gray[my0:my1, mx0:mx1]
-            mouth_eq  = face_eq[my0:my1,   mx0:mx1]
 
             if mouth_raw.size == 0:
                 continue
@@ -135,22 +135,29 @@ class CameraDetector(QThread):
             mouth_h, mouth_w = mouth_raw.shape
             mouth_area = mouth_h * mouth_w
 
-            # OTSU on equalized mouth region
-            _, binary = cv2.threshold(
-                mouth_eq, 0, 255,
-                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-            )
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
-            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k)
+            # Forehead skin reference — well above glasses, never affected by mouth state
+            fr_y0, fr_y1 = int(h * 0.04), int(h * 0.20)
+            fr_x0, fr_x1 = int(w * 0.25), int(w * 0.75)
+            fore_patch = face_gray[fr_y0:fr_y1, fr_x0:fr_x1]
+            face_ref = float(np.median(fore_patch)) if fore_patch.size > 0 \
+                       else float(np.median(face_gray))
+
+            # Cavity threshold: pixels < 68 % of forehead brightness are cavity.
+            # Using median (not mean) avoids inflation by specular highlights.
+            cavity_thresh = int(face_ref * 0.68)
+            dark_mask = (mouth_raw < cavity_thresh).astype(np.uint8) * 255
+
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k)
+            dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN,  k)
 
             contours, _ = cv2.findContours(
-                binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
             if not contours:
                 continue
 
-            valid = [c for c in contours if cv2.contourArea(c) > 40]
+            valid = [c for c in contours if cv2.contourArea(c) > 25]
             if not valid:
                 continue
 
@@ -159,7 +166,7 @@ class CameraDetector(QThread):
             mar       = dark_area / mouth_area
             _, _, bw_c, bh_c = cv2.boundingRect(largest)
 
-            if mar < 0.05:   # skip if the image has a closed mouth
+            if mar < 0.05:   # skip if no real cavity detected
                 continue
 
             mar_vals.append(mar)
@@ -172,14 +179,15 @@ class CameraDetector(QThread):
         # Use 60 % of the minimum observed value as the live threshold.
         # This means a yawn only needs to be 60 % as obvious as the most
         # subtle reference to be detected, giving a comfortable margin.
-        self._mar_threshold = float(np.min(mar_vals))   * 0.60
-        self._min_h_ratio   = float(np.min(bh_ratios))  * 0.55
-        self._min_w_ratio   = float(np.min(bw_ratios))  * 0.55
-        # Aspect-ratio lower bound — reference yawns are always wider than tall
+        self._mar_threshold = float(np.min(mar_vals))  * 0.55
+        self._min_h_ratio   = float(np.min(bh_ratios)) * 0.50
+        self._min_w_ratio   = float(np.min(bw_ratios)) * 0.50
+        # Aspect-ratio lower bound — use 45 % of minimum observed to allow tall yawns.
+        # (Stock yawn images can be taller than wide; min 0.30 filters only thin slivers.)
         aspect_refs = [
             bw / bh for bw, bh in zip(bw_ratios, bh_ratios) if bh > 0
         ]
-        self._min_aspect = max(0.80, float(np.min(aspect_refs)) * 0.70)
+        self._min_aspect = max(0.30, float(np.min(aspect_refs)) * 0.45)
 
         print(
             f"[YawnCalib] {len(mar_vals)} reference(s) processed.  "
@@ -352,80 +360,74 @@ class CameraDetector(QThread):
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                     # ── YAWN DETECTION ───────────────────────────────────────
-                    # Use lower portion of the face (below nose), stop before chin
+                    # Use lower face (below nose), exclude chin
                     my0 = int(h * 0.60)
-                    my1 = int(h * 0.92)   # exclude chin — bottom ~8 % is jaw/shadow
-                    mx0 = int(w * 0.18)
-                    mx1 = int(w * 0.82)
+                    my1 = int(h * 0.92)
+                    mx0 = int(w * 0.20)
+                    mx1 = int(w * 0.80)
                     mouth_raw   = face_gray[my0:my1, mx0:mx1]
-                    mouth_eq    = face_eq[my0:my1,   mx0:mx1]
                     mouth_color = face_color[my0:my1, mx0:mx1]
-                    otsu_thresh = 0.0   # initialised here so OT overlay always has a value
+
+                    # ── Forehead skin reference ───────────────────────────────
+                    # Sample the upper forehead — above glasses, never darkened by
+                    # open/closed mouth, stable across yawn and non-yawn frames.
+                    # Uses median to discard specular highlights from glasses.
+                    fr_y0, fr_y1 = int(h * 0.04), int(h * 0.20)
+                    fr_x0, fr_x1 = int(w * 0.25), int(w * 0.75)
+                    fore_patch   = face_gray[fr_y0:fr_y1, fr_x0:fr_x1]
+                    face_ref     = float(np.median(fore_patch)) if fore_patch.size > 0 \
+                                   else float(np.median(face_gray))
 
                     if mouth_raw.size > 0:
                         mouth_h, mouth_w = mouth_raw.shape
                         mouth_area = mouth_h * mouth_w
 
-                        # Use OTSU thresholding on the LOCAL mouth region (equalized).
-                        # OTSU automatically picks the best threshold to split dark vs light
-                        # pixels within THIS region — immune to global face brightness changes.
-                        #
-                        # CRITICAL: the otsu_thresh value itself signals detection quality.
-                        #   High otsu_thresh (≥ 40) → strong bimodal split → real dark cavity.
-                        #   Low  otsu_thresh (<  40) → nearly uniform region → closed mouth;
-                        #     any "dark" pixels are just lip-crease or shadow noise.
-                        # We skip detection entirely when the split is too weak.
-                        otsu_thresh, binary = cv2.threshold(
-                            mouth_eq, 0, 255,
-                            cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+                        # ── Cavity threshold ──────────────────────────────────
+                        # Pixels darker than 68 % of forehead brightness are cavity.
+                        # Forehead reference is above glasses; median avoids highlight bias.
+                        # Lip crease: ~15 % darker than skin → does NOT qualify.
+                        # Real yawn cavity: 35–60 % darker than skin → easily qualifies.
+                        cavity_thresh = int(face_ref * 0.68)
+                        dark_mask = (mouth_raw < cavity_thresh).astype(np.uint8) * 255
+
+                        # Clean up noise (3×3 kernel: gentler than 5×5; preserves small cavities)
+                        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k)
+                        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN,  k)
+
+                        contours, _ = cv2.findContours(
+                            dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
                         )
 
-                        # Gate 0: reject weak-contrast (closed-mouth) frames early
-                        if otsu_thresh < 40:
-                            bx = by = bw_c = bh_c = 0
-                            mar_value = 0.0
-                        else:
-                            # Clean up noise
-                            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-                            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
-                            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,  k)
+                        bx, by, bw_c, bh_c = 0, 0, 0, 0
+                        if contours:
+                            valid = [c for c in contours if cv2.contourArea(c) > 25]
+                            if valid:
+                                largest   = max(valid, key=cv2.contourArea)
+                                dark_area = cv2.contourArea(largest)
+                                mar_value = dark_area / mouth_area
 
-                            contours, _ = cv2.findContours(
-                                binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                            )
+                                bx, by, bw_c, bh_c = cv2.boundingRect(largest)
 
-                            bx, by, bw_c, bh_c = 0, 0, 0, 0
-                            if contours:
-                                valid = [c for c in contours if cv2.contourArea(c) > 40]
-                                if valid:
-                                    largest   = max(valid, key=cv2.contourArea)
-                                    dark_area = cv2.contourArea(largest)
-                                    mar_value = dark_area / mouth_area
+                                # Position gate: cavity centre must be in upper 75 %
+                                # of the ROI — chin shadows are always at the bottom.
+                                cy = by + bh_c // 2
+                                if cy > mouth_h * 0.75:
+                                    bx = by = bw_c = bh_c = 0
+                                    mar_value = 0.0
 
-                                    bx, by, bw_c, bh_c = cv2.boundingRect(largest)
+                                if mar_value >= self._mar_threshold:
+                                    cv2.rectangle(mouth_color,
+                                                  (bx, by), (bx+bw_c, by+bh_c),
+                                                  (0, 165, 255), 2)
 
-                                    # Gate 1: dark region must be in upper 70 % of mouth ROI.
-                                    # A real open-mouth cavity sits between the lips (upper half).
-                                    # Chin shadows appear near the bottom → reject them.
-                                    region_center_y = by + bh_c // 2
-                                    if region_center_y > mouth_h * 0.70:
-                                        bx = by = bw_c = bh_c = 0
-                                        mar_value = 0.0
-
-                                    if mar_value >= self._mar_threshold:
-                                        cv2.rectangle(mouth_color,
-                                                      (bx, by), (bx+bw_c, by+bh_c),
-                                                      (0, 165, 255), 2)
-
-                        # ── Open-mouth gate (thresholds calibrated from reference images) ──
-                        # A real wide-open mouth must satisfy ALL of:
-                        #   1. Dark area ≥ _mar_threshold  of the mouth region
-                        #   2. Bounding-box height  ≥ _min_h_ratio * mouth_h
-                        #   3. Bounding-box width   ≥ _min_w_ratio * mouth_w
-                        #   4. Aspect ratio bw/bh   ≥ _min_aspect
-                        # Thin lip-crease / chin shadows fail one or more of these.
-                        # Thresholds are derived from camera/references/ at startup;
-                        # default to conservative hardcoded values if no references.
+                        # ── Open-mouth gate ───────────────────────────────────
+                        # A real yawn must satisfy ALL of:
+                        #   1. Dark cavity ≥ _mar_threshold of the mouth area
+                        #   2. Blob height  ≥ _min_h_ratio * mouth_h  (not a flat shadow)
+                        #   3. Blob width   ≥ _min_w_ratio * mouth_w  (not a thin crease)
+                        #   4. Blob is not too narrow (min aspect = 0.5, allows tall yawns)
+                        # Thresholds derived from camera/references/ at startup.
                         min_h     = int(mouth_h * self._min_h_ratio)
                         min_w     = int(mouth_w * self._min_w_ratio)
                         aspect_ok = (bh_c > 0) and (bw_c / bh_c >= self._min_aspect)
@@ -436,14 +438,14 @@ class CameraDetector(QThread):
                             and aspect_ok
                         )
 
-                        # ── 4-frame debounce (~130 ms) before timer starts ────
-                        # Prevents any single noisy frame from triggering the counter.
+                        # ── 2-frame debounce (~66 ms) before timer starts ─────
+                        # Filters single-frame noise while keeping fast response.
                         if is_mouth_open:
                             self._mouth_open_frames += 1
                         else:
                             self._mouth_open_frames = 0
 
-                        mouth_confirmed = self._mouth_open_frames >= 4
+                        mouth_confirmed = self._mouth_open_frames >= 2
 
                         # ── Yawn timing ──────────────────────────────────────
                         cooldown_ok = (current_time - self._last_yawn_time) >= self._yawn_cooldown_s
@@ -471,16 +473,13 @@ class CameraDetector(QThread):
                             self._mouth_open_start  = None
                             self._yawn_registered   = False
 
-                    # On-frame metrics
-                    ear_col  = (0, 0, 255) if eyes_closed else (0, 255, 0)
-                    mar_col  = (0, 0, 255) if mar_value >= self._mar_threshold else (0, 255, 0)
-                    otsu_col = (0, 0, 255) if otsu_thresh < 40 else (0, 255, 0)
+                    # On-frame metrics (OT removed from display; cavity_thresh used internally)
+                    ear_col = (0, 0, 255) if eyes_closed else (0, 255, 0)
+                    mar_col = (0, 0, 255) if mar_value >= self._mar_threshold else (0, 255, 0)
                     cv2.putText(small, f"EAR: {ear_value:.2f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, ear_col, 2)
                     cv2.putText(small, f"MAR: {mar_value:.2f}", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, mar_col, 2)
-                    cv2.putText(small, f"OT:  {int(otsu_thresh)}", (10, 90),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, otsu_col, 2)
 
                 else:
                     # No face — reset all transient state
