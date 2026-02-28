@@ -1,0 +1,9 @@
+{
+    "C_Cpp.intelliSenseEngine": "Tag Parser",
+    "files.associations": {
+        "*.ino": "cpp",
+        "*.tcc": "cpp"
+    },
+    "editor.formatOnSave": false,
+    "C_Cpp.errorSquiggles": "Disabled"
+}

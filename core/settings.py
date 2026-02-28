@@ -15,7 +15,6 @@ DEFAULTS = {
     "vibration_freq_l2": 5.0,
     "alarm_track": 1,
     "alarm_volume": 15,
-    "thresholds_override": False,
     "tilt_threshold_deg": 30.0,
     "tilt_duration_s": 3.0,
     "eyes_closed_threshold_s": 2.0,

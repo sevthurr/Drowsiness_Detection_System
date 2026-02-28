@@ -117,16 +117,14 @@ class SimulatorEngine(QObject):
         self._alarm_playing = False
 
     def _th(self):
-        """Return effective thresholds (override vs defaults)."""
-        use_override = self.settings.get("thresholds_override", False)
-        src = self.settings if use_override else type("D", (), {"get": lambda s, k, d=None: DEFAULTS.get(k, d)})()
+        """Return effective thresholds from settings."""
         return {
-            "tilt_deg": float(src.get("tilt_threshold_deg", 30)),
-            "tilt_dur": float(src.get("tilt_duration_s", 3)),
-            "eyes_s": float(src.get("eyes_closed_threshold_s", 2)),
-            "eyes_crit": float(src.get("eyes_critical_s", 4)),
-            "yawns": float(src.get("yawns_per_min_threshold", 2)),
-            "ack_t": float(src.get("acknowledge_timeout_s", 10)),
+            "tilt_deg": float(self.settings.get("tilt_threshold_deg", 30)),
+            "tilt_dur": float(self.settings.get("tilt_duration_s", 3)),
+            "eyes_s": float(self.settings.get("eyes_closed_threshold_s", 2)),
+            "eyes_crit": float(self.settings.get("eyes_critical_s", 4)),
+            "yawns": float(self.settings.get("yawns_per_min_threshold", 2)),
+            "ack_t": float(self.settings.get("acknowledge_timeout_s", 10)),
         }
 
     def _tick(self):
