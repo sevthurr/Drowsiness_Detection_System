@@ -58,11 +58,11 @@
 // ============================================================================
 
 // Wi-Fi credentials
-const char* WIFI_SSID     = "YourWiFiSSID";
-const char* WIFI_PASSWORD = "YourWiFiPassword";
+const char* WIFI_SSID     = "ZTE_5G_ni2RJ9";
+const char* WIFI_PASSWORD = "AHdgjiAg";
 
 // Python server — laptop local IP, port 5000, path /sensor
-const char* SERVER_HOST = "192.168.1.100";
+const char* SERVER_HOST = "192.168.1.21";
 const int   SERVER_PORT = 5000;
 const char* SERVER_PATH = "/sensor";
 
