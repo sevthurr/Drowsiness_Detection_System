@@ -75,7 +75,7 @@ class MonitoringPage(QWidget):
         grid.setSpacing(10)
 
         self.m_eyes = MetricCard("Eyes Closed (s)", "0.0")
-        self.m_yawns = MetricCard("Yawns / min", "0")
+        self.m_yawns = MetricCard("Yawns/min", "0")
         self.m_tilt = MetricCard("Tilt (\u00b0)", "0")
         self.m_tilt_dur = MetricCard("Tilt > Thresh (s)", "0.0")
         self.m_alert = MetricCard("Alert Level", "OK")

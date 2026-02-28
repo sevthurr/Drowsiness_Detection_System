@@ -125,7 +125,7 @@ class SimulatorEngine(QObject):
             "tilt_dur": float(src.get("tilt_duration_s", 3)),
             "eyes_s": float(src.get("eyes_closed_threshold_s", 2)),
             "eyes_crit": float(src.get("eyes_critical_s", 4)),
-            "yawns": float(src.get("yawns_per_min_threshold", 3)),
+            "yawns": float(src.get("yawns_per_min_threshold", 2)),
             "ack_t": float(src.get("acknowledge_timeout_s", 10)),
         }
 

@@ -159,7 +159,7 @@ class RightPanel(QWidget):
         self._th_tilt_dur.setValue(float(s.get("tilt_duration_s", 3)))
         self._th_eyes_s.setValue(float(s.get("eyes_closed_threshold_s", 2)))
         self._th_eyes_crit.setValue(float(s.get("eyes_critical_s", 4)))
-        self._th_yawns.setValue(float(s.get("yawns_per_min_threshold", 3)))
+        self._th_yawns.setValue(float(s.get("yawns_per_min_threshold", 2)))
         self._th_ack_t.setValue(float(s.get("acknowledge_timeout_s", 10)))
 
     # ── handlers ────────────────────────────────────────────────────
