@@ -77,7 +77,7 @@ class CenterPanel(QWidget):
         grid = QGridLayout()
         grid.setSpacing(10)
         self.m_eyes = MetricCard("Eyes Closed (s)", "0.0")
-        self.m_yawns = MetricCard("Yawns / min", "0")
+        self.m_yawns = MetricCard("Yawns / 10 min", "0")
         self.m_tilt = MetricCard("Tilt (°)", "0")
         self.m_tilt_dur = MetricCard("Tilt Over Thresh (s)", "0.0")
         self.m_alert = MetricCard("Alert Level", "OK")
@@ -138,7 +138,7 @@ class CenterPanel(QWidget):
     def update_state(self, s: dict):
         level = s.get("alert_level", "OK")
         eyes = s.get("eyes_closed_s", 0.0)
-        yawns = s.get("yawns_per_min", 0.0)
+        yawns = s.get("yawns_per_10min", 0.0)
         tilt = s.get("tilt_deg", 0.0)
         tilt_d = s.get("tilt_over_threshold_s", 0.0)
         ack = s.get("ack_remaining_s", 0.0)

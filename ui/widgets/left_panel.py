@@ -98,7 +98,7 @@ class LeftPanel(QWidget):
         ml2.addWidget(self._force_eyes)
 
         # Yawns slider
-        ml2.addWidget(QLabel("Yawns / min (0-6)"))
+        ml2.addWidget(QLabel("Yawns / 10 min (0-6)"))
         yawn_row = QHBoxLayout()
         self._yawn_slider = QSlider(Qt.Orientation.Horizontal)
         self._yawn_slider.setRange(0, 6)

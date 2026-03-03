@@ -19,7 +19,7 @@ DEFAULTS = {
     "tilt_duration_s": 3.0,
     "eyes_closed_threshold_s": 2.0,
     "eyes_critical_s": 4.0,
-    "yawns_per_min_threshold": 2.0,
+    "yawns_per_10min_threshold": 3,
     "acknowledge_timeout_s": 10.0,
 }
 

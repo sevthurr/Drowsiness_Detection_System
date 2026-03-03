@@ -126,7 +126,7 @@ class SimulatorEngine(QObject):
             "tilt_dur": float(self.settings.get("tilt_duration_s", 3)),
             "eyes_s": float(self.settings.get("eyes_closed_threshold_s", 2)),
             "eyes_crit": float(self.settings.get("eyes_critical_s", 4)),
-            "yawns": float(self.settings.get("yawns_per_min_threshold", 2)),
+            "yawns": float(self.settings.get("yawns_per_10min_threshold", 3)),
             "ack_t": float(self.settings.get("acknowledge_timeout_s", 10)),
         }
 
@@ -204,7 +204,7 @@ class SimulatorEngine(QObject):
                     self._ack_remaining = th["ack_t"]
                     self._alert_active = True
                     self.event_log.add(
-                        f"Level 1 triggered — {eff_yawns:.0f} yawns/min",
+                        f"Level 1 triggered — {eff_yawns:.0f} yawns in 10 min",
                         "warning",
                     )
 
@@ -238,7 +238,7 @@ class SimulatorEngine(QObject):
             "tilt_deg": self._tilt_deg,
             "tilt_over_threshold_s": self._tilt_over_s,
             "eyes_closed_s": eyes,
-            "yawns_per_min": yawns,
+            "yawns_per_10min": yawns,
             "alert_level": self._alert_level,
             "alert_reason": self._alert_reason,
             "is_critical": self._is_critical,

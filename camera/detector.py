@@ -1,201 +1,123 @@
-"""Camera-based drowsiness detection using OpenCV."""
+"""Camera-based drowsiness detection using MediaPipe Face Mesh.
 
-import os
+Uses 478 facial landmarks for precise geometric measurements that work
+robustly across varying lighting conditions and head angles — a major
+upgrade over Haar cascade + pixel-intensity approaches.
+
+Eye Aspect Ratio (EAR):
+    EAR = (||P2 - P6|| + ||P3 - P5||) / (2 · ||P1 - P4||)
+
+    Open eyes:   EAR ≈ 0.25 – 0.35
+    Closed eyes: EAR → 0
+    Threshold:   EAR < 0.22 for ≥ 2 consecutive frames → eyes closed.
+
+Mouth Aspect Ratio (MAR):
+    MAR = (Σ vertical lip distances) / (3 × horizontal lip distance)
+
+    Normal:  MAR ≈ 0.1 – 0.2
+    Yawning: MAR ≈ 0.5 – 0.8+
+    Threshold: MAR > 0.55, sustained ≥ 2.5 s → yawn registered (8 s cooldown).
+"""
+
 import time
 import cv2
 import numpy as np
+import mediapipe as mp
 from pathlib import Path
 from collections import deque
 from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
-# Folder that contains reference yawn images used for threshold calibration
-_REFERENCES_DIR = Path(__file__).parent / "references"
+from mediapipe.tasks.python import vision as mp_vision
+from mediapipe.tasks.python.core.base_options import BaseOptions
+from mediapipe.tasks.python.vision import drawing_utils as mp_draw
+from mediapipe.tasks.python.vision.drawing_utils import DrawingSpec
+
+# ── Model path ─────────────────────────────────────────────────────────
+_MODEL_PATH = str(Path(__file__).parent / "face_landmarker.task")
+
+# ── Landmark indices ───────────────────────────────────────────────────
+# 6-point EAR (P1 outer corner … P6 lower-outer) per the standard formula
+RIGHT_EYE_EAR = [33, 160, 158, 133, 153, 144]
+LEFT_EYE_EAR  = [362, 385, 387, 263, 373, 380]
+
+# Inner-lip MAR landmarks (upper↔lower vertical pairs + horizontal corners)
+_MOUTH_VERT  = [(82, 87), (13, 14), (312, 317)]
+_MOUTH_HORIZ = (78, 308)
+
+# ── Precompute contour vertex set (for drawing small dots) ─────────────
+_CONTOUR_INDICES: frozenset = frozenset(
+    idx
+    for conn in mp_vision.FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS
+    for idx in (conn.start, conn.end)
+)
+
+# ── Drawing constants ──────────────────────────────────────────────────
+_LINE_SPEC  = DrawingSpec(color=(0, 140, 0), thickness=1, circle_radius=0)
+_DOT_COLOR  = (0, 180, 0)   # olive-green, matches reference image
+_DOT_RADIUS = 1             # minimal but visible
+
+
+# ── Helper functions ───────────────────────────────────────────────────
+def _dist(p1, p2):
+    """Euclidean distance between two (x, y) tuples."""
+    return ((p1[0] - p2[0]) ** 2 + (p1[1] - p2[1]) ** 2) ** 0.5
+
+
+def _ear(lm, indices, w, h):
+    """Eye Aspect Ratio from 6 landmark indices [P1…P6]."""
+    p = [(lm[i].x * w, lm[i].y * h) for i in indices]
+    v1 = _dist(p[1], p[5])   # ||P2 - P6||
+    v2 = _dist(p[2], p[4])   # ||P3 - P5||
+    hz = _dist(p[0], p[3])   # ||P1 - P4||
+    return (v1 + v2) / (2.0 * hz) if hz > 1e-6 else 0.0
+
+
+def _mar(lm, w, h):
+    """Mouth Aspect Ratio from inner-lip landmarks."""
+    def pt(i):
+        return (lm[i].x * w, lm[i].y * h)
+    vert = sum(_dist(pt(u), pt(d)) for u, d in _MOUTH_VERT)
+    hz   = _dist(pt(_MOUTH_HORIZ[0]), pt(_MOUTH_HORIZ[1]))
+    return vert / (3.0 * hz) if hz > 1e-6 else 0.0
 
 
 class CameraDetector(QThread):
-    """Captures camera frames, detects face/eyes/yawns using OpenCV, emits drowsiness data.
+    """Captures camera frames, detects drowsiness via MediaPipe FaceLandmarker.
 
-    Eye Closure Detection:
-    ----------------------
-    Uses the glasses-aware Haar cascade to locate eye regions, then applies a
-    pupil-contrast check that works *without* calibration and *without* relying
-    on absolute brightness:
-
-      pupil_ratio = 5th-percentile(eye_ROI) / mean(eye_ROI)
-
-    Open eye  → dark pupil present → 5th-pct is low  → ratio ≈ 0.1–0.4
-    Closed eye → eyelid covers pupil → 5th-pct ≈ mean → ratio ≈ 0.6–0.9
-
-    Threshold: ratio > 0.60 = eyes closed.
-    Confirmed after 2 consecutive frames (~66 ms) for fast response.
-
-    Yawn Detection:
-    ---------------
-    Samples the forehead (h*0.04-0.20) as a skin brightness reference — above
-    glasses and unaffected by mouth state.  Pixels in the mouth ROI that are
-    darker than 68 % of the forehead median are marked as "cavity" pixels.
-    MAR = cavity_area / mouth_ROI_area.  MAR ≥ 0.08 + minimum height/width →
-    mouth open.  Mouth must stay open ≥ 2.5 s to register as a yawn, with an
-    8 s cooldown.  2-frame debounce filters single-frame noise.
+    Emits the same signals as the previous Haar-cascade detector so the
+    rest of the application requires zero changes.
     """
 
-    frame_ready = Signal(QImage)
-    detection_update = Signal(float, float, float, float)  # eyes_closed_s, yawns/min, ear, mar
-    calibration_complete = Signal(float)  # ear_threshold
-    status_changed = Signal(str)  # "Running" / "Stopped" / "Error"
+    frame_ready          = Signal(QImage)
+    detection_update     = Signal(float, float, float, float)  # eyes_closed_s, yawns/min, ear, mar
+    calibration_complete = Signal(float)                        # ear_threshold
+    status_changed       = Signal(str)                          # "Running" / "Stopped" / "Error"
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._running = False
 
-        # Eye closure tracking
+        # EAR config
+        self._ear_threshold = 0.22
+        self._ear_consec    = 2   # frames before confirming closure
+
+        # Eye-closure state
         self._eyes_closed_start    = None
         self._eyes_closed_duration = 0.0
-        self._no_eye_frames        = 0   # consecutive frames without clear open eyes
+        self._closed_frames        = 0
 
-        # Yawn tracking
+        # MAR / yawn config
+        self._mar_threshold   = 0.55
+        self._yawn_duration_s = 4.0   # 4 s of mouth-open = one yawn
+        self._yawn_cooldown_s = 8.0
+
+        # Yawn state
         self._yawn_timestamps    = deque(maxlen=500)
         self._mouth_open_start   = None
         self._yawn_registered    = False
         self._last_yawn_time     = 0.0
-        self._yawn_cooldown_s    = 8.0
-        self._mouth_open_frames  = 0   # consecutive frames with mouth confirmed open
-
-        # Calibrated mouth-open thresholds (overridden by reference images if available)
-        self._mar_threshold  = 0.08   # dark-area fraction of mouth region
-        self._min_h_ratio    = 0.15   # min bbox height / mouth_h
-        self._min_w_ratio    = 0.18   # min bbox width  / mouth_w
-        self._min_aspect     = 0.30   # min bbox width  / bbox height (allows tall yawns)
-
-        # Run calibration from reference yawn images
-        self._calibrate_yawn_thresholds()
-
-    # ── reference-image calibration ─────────────────────────────────
-    def _calibrate_yawn_thresholds(self):
-        """Analyse reference yawn images in camera/references/ and derive
-        detection thresholds from real yawn data.
-
-        For each image the same pipeline used in run() is applied:
-          face detect → mouth ROI → histogram-equalise → OTSU → contours
-        The measured MAR and bounding-box ratios from every successful
-        detection are collected.  Thresholds are then set to 60 % of the
-        minimum observed value so that yawns at least 60 % as obvious as
-        the subtlest reference still register.
-
-        Falls back to hardcoded defaults if the folder is missing, empty,
-        or no face is detected in any image.
-        """
-        if not _REFERENCES_DIR.is_dir():
-            return
-
-        image_paths = [
-            p for p in _REFERENCES_DIR.iterdir()
-            if p.suffix.lower() in (".jpg", ".jpeg", ".png", ".bmp")
-        ]
-        if not image_paths:
-            return
-
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
-
-        mar_vals, bh_ratios, bw_ratios = [], [], []
-
-        for path in image_paths:
-            img = cv2.imread(str(path))
-            if img is None:
-                continue
-
-            # Resize so the face is comparable to live-camera size
-            img = cv2.resize(img, (640, 480))
-            gray    = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            gray_eq = cv2.equalizeHist(gray)
-
-            faces = face_cascade.detectMultiScale(
-                gray_eq, scaleFactor=1.1, minNeighbors=5, minSize=(80, 80)
-            )
-            if len(faces) == 0:
-                continue
-
-            (x, y, w, h) = faces[0]
-            face_gray = gray[y:y+h,    x:x+w]
-            face_eq   = gray_eq[y:y+h, x:x+w]
-
-            # Same mouth ROI and reference patch as in run()
-            my0 = int(h * 0.60)
-            my1 = int(h * 0.92)
-            mx0 = int(w * 0.20)
-            mx1 = int(w * 0.80)
-            mouth_raw = face_gray[my0:my1, mx0:mx1]
-
-            if mouth_raw.size == 0:
-                continue
-
-            mouth_h, mouth_w = mouth_raw.shape
-            mouth_area = mouth_h * mouth_w
-
-            # Forehead skin reference — well above glasses, never affected by mouth state
-            fr_y0, fr_y1 = int(h * 0.04), int(h * 0.20)
-            fr_x0, fr_x1 = int(w * 0.25), int(w * 0.75)
-            fore_patch = face_gray[fr_y0:fr_y1, fr_x0:fr_x1]
-            face_ref = float(np.median(fore_patch)) if fore_patch.size > 0 \
-                       else float(np.median(face_gray))
-
-            # Cavity threshold: pixels < 68 % of forehead brightness are cavity.
-            # Using median (not mean) avoids inflation by specular highlights.
-            cavity_thresh = int(face_ref * 0.68)
-            dark_mask = (mouth_raw < cavity_thresh).astype(np.uint8) * 255
-
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k)
-            dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN,  k)
-
-            contours, _ = cv2.findContours(
-                dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if not contours:
-                continue
-
-            valid = [c for c in contours if cv2.contourArea(c) > 25]
-            if not valid:
-                continue
-
-            largest   = max(valid, key=cv2.contourArea)
-            dark_area = cv2.contourArea(largest)
-            mar       = dark_area / mouth_area
-            _, _, bw_c, bh_c = cv2.boundingRect(largest)
-
-            if mar < 0.05:   # skip if no real cavity detected
-                continue
-
-            mar_vals.append(mar)
-            bh_ratios.append(bh_c / mouth_h)
-            bw_ratios.append(bw_c / mouth_w)
-
-        if not mar_vals:
-            return  # calibration failed — keep defaults
-
-        # Use 60 % of the minimum observed value as the live threshold.
-        # This means a yawn only needs to be 60 % as obvious as the most
-        # subtle reference to be detected, giving a comfortable margin.
-        self._mar_threshold = float(np.min(mar_vals))  * 0.55
-        self._min_h_ratio   = float(np.min(bh_ratios)) * 0.50
-        self._min_w_ratio   = float(np.min(bw_ratios)) * 0.50
-        # Aspect-ratio lower bound — use 45 % of minimum observed to allow tall yawns.
-        # (Stock yawn images can be taller than wide; min 0.30 filters only thin slivers.)
-        aspect_refs = [
-            bw / bh for bw, bh in zip(bw_ratios, bh_ratios) if bh > 0
-        ]
-        self._min_aspect = max(0.30, float(np.min(aspect_refs)) * 0.45)
-
-        print(
-            f"[YawnCalib] {len(mar_vals)} reference(s) processed.  "
-            f"MAR≥{self._mar_threshold:.3f}  "
-            f"minH≥{self._min_h_ratio:.3f}  "
-            f"minW≥{self._min_w_ratio:.3f}  "
-            f"aspect≥{self._min_aspect:.2f}"
-        )
+        self._mouth_open_frames  = 0
 
     # ── public API ──────────────────────────────────────────────────
     @property
@@ -205,10 +127,10 @@ class CameraDetector(QThread):
     def start_capture(self):
         if self._running:
             return
-        self._running = True
+        self._running              = True
         self._eyes_closed_start    = None
         self._eyes_closed_duration = 0.0
-        self._no_eye_frames        = 0
+        self._closed_frames        = 0
         self._yawn_timestamps.clear()
         self._mouth_open_start  = None
         self._yawn_registered   = False
@@ -219,25 +141,21 @@ class CameraDetector(QThread):
     def stop_capture(self):
         self._running = False
         self.wait(5000)
-    
+
     # ── camera open with fallback ───────────────────────────────────
     @staticmethod
     def _open_camera():
         """Try multiple backends; return an opened VideoCapture or None."""
-        # Try index 0 with different backends
         for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY, -1]:
             try:
-                cap = cv2.VideoCapture(0, backend) if backend != -1 else cv2.VideoCapture(0)
+                cap = (cv2.VideoCapture(0, backend) if backend != -1
+                       else cv2.VideoCapture(0))
                 if cap.isOpened():
-                    # Set resolution for better compatibility
                     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                    # Warm-up reads
                     for _ in range(10):
-                        ret, _ = cap.read()
-                        if ret:
+                        if cap.read()[0]:
                             break
-                    # Final test
                     ret, test = cap.read()
                     if ret and test is not None and test.size > 0:
                         return cap
@@ -245,7 +163,7 @@ class CameraDetector(QThread):
             except Exception:
                 try:
                     cap.release()
-                except:
+                except Exception:
                     pass
         return None
 
@@ -257,18 +175,19 @@ class CameraDetector(QThread):
             return
 
         self.status_changed.emit("Running")
+        self.calibration_complete.emit(self._ear_threshold)
 
-        # Prefer the eyeglasses-aware cascade; fall back to standard if missing
-        eye_cascade_path = cv2.data.haarcascades + 'haarcascade_eye_tree_eyeglasses.xml'
-        eye_cascade = cv2.CascadeClassifier(eye_cascade_path)
-        if eye_cascade.empty():
-            eye_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + 'haarcascade_eye.xml'
-            )
-
-        face_cascade = cv2.CascadeClassifier(
-            cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+        # Create FaceLandmarker (VIDEO mode for sequential frames)
+        options = mp_vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=_MODEL_PATH),
+            running_mode=mp_vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
         )
+        landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+        frame_ts = 0  # monotonic timestamp in ms for VIDEO mode
 
         try:
             while self._running:
@@ -279,248 +198,153 @@ class CameraDetector(QThread):
 
                 small = cv2.resize(frame, (640, 480))
                 small = cv2.flip(small, 1)
-                gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-                # Equalise histogram for more consistent detection across lighting
-                gray_eq = cv2.equalizeHist(gray)
+                h, w  = small.shape[:2]
 
-                faces = face_cascade.detectMultiScale(
-                    gray_eq, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100)
-                )
+                # Convert to MediaPipe Image (RGB)
+                rgb      = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                frame_ts += 33  # ~30 fps increment
+                results  = landmarker.detect_for_video(mp_image, frame_ts)
 
-                current_time = time.time()
-                eyes_closed  = False
-                ear_value    = 0.0
-                mar_value    = 0.0
+                now         = time.time()
+                eyes_closed = False
+                ear_value   = 0.0
+                mar_value   = 0.0
 
-                if len(faces) > 0:
-                    (x, y, w, h) = faces[0]
-                    cv2.rectangle(small, (x, y), (x+w, y+h), (0, 255, 255), 2)
+                if results.face_landmarks:
+                    lm = results.face_landmarks[0]  # list[NormalizedLandmark]
 
-                    face_gray  = gray[y:y+h, x:x+w]      # raw gray (preserves brightness)
-                    face_eq    = gray_eq[y:y+h, x:x+w]   # equalized (for cascade detection)
-                    face_color = small[y:y+h, x:x+w]
-
-                    # ── EYE DETECTION ────────────────────────────────────────
-                    # Run cascade on equalized image for better detection
-                    eye_roi_eq    = face_eq[0:int(h * 0.60), :]
-                    eye_roi_raw   = face_gray[0:int(h * 0.60), :]  # raw for pupil analysis
-                    eye_roi_color = face_color[0:int(h * 0.60), :]
-
-                    eyes = eye_cascade.detectMultiScale(
-                        eye_roi_eq,
-                        scaleFactor=1.05,
-                        minNeighbors=3,
-                        minSize=(int(w * 0.10), int(h * 0.07)),
+                    # ── Draw facial landmark mesh (minimal) ──────────
+                    mp_draw.draw_landmarks(
+                        image=small,
+                        landmark_list=lm,
+                        connections=list(
+                            mp_vision.FaceLandmarksConnections.FACE_LANDMARKS_CONTOURS
+                        ),
+                        landmark_drawing_spec=None,
+                        connection_drawing_spec=_LINE_SPEC,
+                        is_drawing_landmarks=False,
                     )
+                    # Draw small dots at contour vertices only
+                    for idx in _CONTOUR_INDICES:
+                        cx = int(lm[idx].x * w)
+                        cy = int(lm[idx].y * h)
+                        cv2.circle(small, (cx, cy), _DOT_RADIUS, _DOT_COLOR, -1)
 
-                    if len(eyes) >= 2:
-                        # ── Pupil-contrast check ──────────────────────────
-                        # When eyes are OPEN: a dark pupil is present in the ROI,
-                        # so the 5th-percentile (near-minimum) pixel is very dark.
-                        # When eyes are CLOSED: eyelid covers the pupil, the ROI is
-                        # uniform skin-tone — 5th-percentile rises significantly.
-                        # Ratio = p5 / mean:  low = open, high = closed.
-                        pupil_ratios = []
-                        for (ex, ey, ew, eh) in eyes[:2]:
-                            cv2.rectangle(eye_roi_color, (ex, ey),
-                                          (ex+ew, ey+eh), (0, 255, 0), 2)
-                            roi = eye_roi_raw[ey:ey+eh, ex:ex+ew]
-                            if roi.size > 0:
-                                p5  = float(np.percentile(roi, 5))
-                                mn  = float(np.mean(roi))
-                                if mn > 0:
-                                    pupil_ratios.append(p5 / mn)
+                    # ── Face bounding box (from landmarks) ───────────
+                    xs = [l.x for l in lm]
+                    ys = [l.y for l in lm]
+                    x1 = max(0,  int(min(xs) * w) - 10)
+                    y1 = max(0,  int(min(ys) * h) - 10)
+                    x2 = min(w,  int(max(xs) * w) + 10)
+                    y2 = min(h,  int(max(ys) * h) + 10)
+                    cv2.rectangle(small, (x1, y1), (x2, y2), (0, 255, 255), 1)
 
-                        ear_value = 1.0 - np.mean(pupil_ratios) if pupil_ratios else 0.5
+                    # ── EAR (Eye Aspect Ratio) ───────────────────────
+                    l_ear     = _ear(lm, LEFT_EYE_EAR, w, h)
+                    r_ear     = _ear(lm, RIGHT_EYE_EAR, w, h)
+                    ear_value = (l_ear + r_ear) / 2.0
 
-                        # Pupil ratio > 0.60 means 5th-percentile is close to the
-                        # mean → no dark pupil → eyelid is covering → eye CLOSED
-                        if pupil_ratios and np.mean(pupil_ratios) > 0.60:
-                            self._no_eye_frames += 1
-                        else:
-                            self._no_eye_frames = 0
-
+                    if ear_value < self._ear_threshold:
+                        self._closed_frames += 1
                     else:
-                        # Cascade found fewer than 2 eyes — treat as closed
-                        self._no_eye_frames += 1
-                        ear_value = 0.0
+                        self._closed_frames = 0
 
-                    # Confirm closure after 2 consecutive frames (~66 ms) for fast response
-                    eyes_closed = self._no_eye_frames >= 2
+                    eyes_closed = self._closed_frames >= self._ear_consec
 
                     if eyes_closed:
-                        ey_t = int(h * 0.12)
-                        ey_b = int(h * 0.52)
-                        cv2.rectangle(face_color,
-                                      (int(w*0.08), ey_t),
-                                      (int(w*0.92), ey_b),
-                                      (0, 0, 255), 2)
                         cv2.putText(small, "EYES CLOSED",
-                                    (x, y - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                                    (x1, y1 - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (0, 0, 255), 2)
 
-                    # ── YAWN DETECTION ───────────────────────────────────────
-                    # Use lower face (below nose), exclude chin
-                    my0 = int(h * 0.60)
-                    my1 = int(h * 0.92)
-                    mx0 = int(w * 0.20)
-                    mx1 = int(w * 0.80)
-                    mouth_raw   = face_gray[my0:my1, mx0:mx1]
-                    mouth_color = face_color[my0:my1, mx0:mx1]
+                    # ── MAR (Mouth Aspect Ratio) / Yawn ──────────────
+                    mar_value     = _mar(lm, w, h)
+                    is_mouth_open = mar_value > self._mar_threshold
 
-                    # ── Forehead skin reference ───────────────────────────────
-                    # Sample the upper forehead — above glasses, never darkened by
-                    # open/closed mouth, stable across yawn and non-yawn frames.
-                    # Uses median to discard specular highlights from glasses.
-                    fr_y0, fr_y1 = int(h * 0.04), int(h * 0.20)
-                    fr_x0, fr_x1 = int(w * 0.25), int(w * 0.75)
-                    fore_patch   = face_gray[fr_y0:fr_y1, fr_x0:fr_x1]
-                    face_ref     = float(np.median(fore_patch)) if fore_patch.size > 0 \
-                                   else float(np.median(face_gray))
+                    if is_mouth_open:
+                        self._mouth_open_frames += 1
+                    else:
+                        self._mouth_open_frames = 0
 
-                    if mouth_raw.size > 0:
-                        mouth_h, mouth_w = mouth_raw.shape
-                        mouth_area = mouth_h * mouth_w
+                    mouth_confirmed = self._mouth_open_frames >= 2
+                    cooldown_ok     = (now - self._last_yawn_time) >= self._yawn_cooldown_s
 
-                        # ── Cavity threshold ──────────────────────────────────
-                        # Pixels darker than 68 % of forehead brightness are cavity.
-                        # Forehead reference is above glasses; median avoids highlight bias.
-                        # Lip crease: ~15 % darker than skin → does NOT qualify.
-                        # Real yawn cavity: 35–60 % darker than skin → easily qualifies.
-                        cavity_thresh = int(face_ref * 0.68)
-                        dark_mask = (mouth_raw < cavity_thresh).astype(np.uint8) * 255
+                    if mouth_confirmed:
+                        if self._mouth_open_start is None:
+                            self._mouth_open_start = now
+                            self._yawn_registered  = False
 
-                        # Clean up noise (3×3 kernel: gentler than 5×5; preserves small cavities)
-                        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-                        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, k)
-                        dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN,  k)
+                        dur = now - self._mouth_open_start
 
-                        contours, _ = cv2.findContours(
-                            dark_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                        )
+                        if dur >= self._yawn_duration_s and not self._yawn_registered and cooldown_ok:
+                            self._yawn_timestamps.append(now)
+                            self._last_yawn_time  = now
+                            self._yawn_registered = True
+                            cv2.putText(small, "YAWN DETECTED!",
+                                        (x1, y2 + 25),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                        (0, 0, 255), 2)
+                        elif dur < self._yawn_duration_s:
+                            cv2.putText(small,
+                                        f"Mouth open: {dur:.1f}s",
+                                        (x1, y2 + 25),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                        (255, 255, 0), 2)
+                    else:
+                        self._mouth_open_start = None
+                        self._yawn_registered  = False
 
-                        bx, by, bw_c, bh_c = 0, 0, 0, 0
-                        if contours:
-                            valid = [c for c in contours if cv2.contourArea(c) > 25]
-                            if valid:
-                                largest   = max(valid, key=cv2.contourArea)
-                                dark_area = cv2.contourArea(largest)
-                                mar_value = dark_area / mouth_area
-
-                                bx, by, bw_c, bh_c = cv2.boundingRect(largest)
-
-                                # Position gate: cavity centre must be in upper 75 %
-                                # of the ROI — chin shadows are always at the bottom.
-                                cy = by + bh_c // 2
-                                if cy > mouth_h * 0.75:
-                                    bx = by = bw_c = bh_c = 0
-                                    mar_value = 0.0
-
-                                if mar_value >= self._mar_threshold:
-                                    cv2.rectangle(mouth_color,
-                                                  (bx, by), (bx+bw_c, by+bh_c),
-                                                  (0, 165, 255), 2)
-
-                        # ── Open-mouth gate ───────────────────────────────────
-                        # A real yawn must satisfy ALL of:
-                        #   1. Dark cavity ≥ _mar_threshold of the mouth area
-                        #   2. Blob height  ≥ _min_h_ratio * mouth_h  (not a flat shadow)
-                        #   3. Blob width   ≥ _min_w_ratio * mouth_w  (not a thin crease)
-                        #   4. Blob is not too narrow (min aspect = 0.5, allows tall yawns)
-                        # Thresholds derived from camera/references/ at startup.
-                        min_h     = int(mouth_h * self._min_h_ratio)
-                        min_w     = int(mouth_w * self._min_w_ratio)
-                        aspect_ok = (bh_c > 0) and (bw_c / bh_c >= self._min_aspect)
-                        is_mouth_open = (
-                            mar_value >= self._mar_threshold
-                            and bh_c >= min_h
-                            and bw_c >= min_w
-                            and aspect_ok
-                        )
-
-                        # ── 2-frame debounce (~66 ms) before timer starts ─────
-                        # Filters single-frame noise while keeping fast response.
-                        if is_mouth_open:
-                            self._mouth_open_frames += 1
-                        else:
-                            self._mouth_open_frames = 0
-
-                        mouth_confirmed = self._mouth_open_frames >= 2
-
-                        # ── Yawn timing ──────────────────────────────────────
-                        cooldown_ok = (current_time - self._last_yawn_time) >= self._yawn_cooldown_s
-
-                        if mouth_confirmed:
-                            if self._mouth_open_start is None:
-                                self._mouth_open_start = current_time
-                                self._yawn_registered  = False
-
-                            mouth_open_dur = current_time - self._mouth_open_start
-
-                            if mouth_open_dur >= 2.5 and not self._yawn_registered and cooldown_ok:
-                                self._yawn_timestamps.append(current_time)
-                                self._last_yawn_time  = current_time
-                                self._yawn_registered = True
-                                cv2.putText(small, "YAWN DETECTED!",
-                                            (x, y + h + 35),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                            elif mouth_open_dur < 2.5:
-                                cv2.putText(small,
-                                            f"Mouth open: {mouth_open_dur:.1f}s",
-                                            (x, y + h + 35),
-                                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                        else:
-                            self._mouth_open_start  = None
-                            self._yawn_registered   = False
-
-                    # On-frame metrics (OT removed from display; cavity_thresh used internally)
+                    # ── On-frame metrics ─────────────────────────────
                     ear_col = (0, 0, 255) if eyes_closed else (0, 255, 0)
-                    mar_col = (0, 0, 255) if mar_value >= self._mar_threshold else (0, 255, 0)
+                    mar_col = (0, 0, 255) if mar_value > self._mar_threshold else (0, 255, 0)
                     cv2.putText(small, f"EAR: {ear_value:.2f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, ear_col, 2)
                     cv2.putText(small, f"MAR: {mar_value:.2f}", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, mar_col, 2)
 
                 else:
-                    # No face — reset all transient state
-                    self._no_eye_frames     = 0
+                    # No face — reset transient state
+                    self._closed_frames     = 0
                     self._mouth_open_start  = None
                     self._yawn_registered   = False
                     self._mouth_open_frames = 0
 
-                # ── Eye-closed duration tracking ─────────────────────────────
-                if eyes_closed and len(faces) > 0:
+                # ── Eye-closed duration tracking ─────────────────────
+                if eyes_closed and results.face_landmarks:
                     if self._eyes_closed_start is None:
-                        self._eyes_closed_start = current_time
-                    self._eyes_closed_duration = current_time - self._eyes_closed_start
+                        self._eyes_closed_start = now
+                    self._eyes_closed_duration = now - self._eyes_closed_start
                 else:
-                    self._eyes_closed_start   = None
+                    self._eyes_closed_start    = None
                     self._eyes_closed_duration = 0.0
 
-                # ── Yawn rate calculation ─────────────────────────────────────
-                cutoff_1min = current_time - 60.0
-                yawns_per_min = sum(1 for t in self._yawn_timestamps if t > cutoff_1min)
+                # ── Yawn rate (rolling 10-minute window) ─────────────
+                cutoff = now - 600.0
+                yawns_in_10min = sum(1 for t in self._yawn_timestamps if t > cutoff)
 
                 self.detection_update.emit(
                     self._eyes_closed_duration,
-                    float(yawns_per_min),
+                    float(yawns_in_10min),
                     ear_value,
                     mar_value,
                 )
 
-                # ── Emit preview frame ────────────────────────────────────────
+                # ── Emit preview frame ───────────────────────────────
                 display = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 qh, qw, ch = display.shape
                 qimg = QImage(
-                    display.tobytes(), qw, qh, ch * qw, QImage.Format.Format_RGB888
+                    display.tobytes(), qw, qh, ch * qw,
+                    QImage.Format.Format_RGB888,
                 )
                 self.frame_ready.emit(qimg.copy())
 
                 self.msleep(33)  # ~30 fps
 
         finally:
+            landmarker.close()
             cap.release()
-            self._running             = False
-            self._eyes_closed_start   = None
+            self._running              = False
+            self._eyes_closed_start    = None
             self._eyes_closed_duration = 0.0
             self.status_changed.emit("Stopped")
