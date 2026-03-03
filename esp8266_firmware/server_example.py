@@ -23,15 +23,32 @@ app = Flask(__name__)
 TILT_ALERT_THRESHOLD = 30.0
 TILT_CRITICAL_THRESHOLD = 45.0
 
-@app.route('/sensor-data', methods=['POST'])
+@app.route('/sensor', methods=['POST'])
 def receive_sensor_data():
     """
     Endpoint to receive sensor data from ESP8266
     """
     try:
+        # Get raw body first for debugging
+        raw = request.get_data(as_text=True)
+
         # Get JSON data from ESP8266
-        data = request.get_json()
-        
+        data = request.get_json(force=True, silent=True)
+
+        # If JSON parsing failed, log raw body and return safe defaults
+        if data is None:
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{timestamp}] BAD JSON received: {repr(raw[:200])}")
+            return jsonify({
+                "visual_score": 0.0,
+                "alert_level": 0,
+                "motor_on": False,
+                "buzzer_on": False,
+                "red_led": False,
+                "green_led": True,
+                "ack_required": False
+            })
+
         # Log received data
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"\n[{timestamp}] Received from {data.get('device_id', 'Unknown')}:")
@@ -39,7 +56,6 @@ def receive_sensor_data():
         print(f"  Over Threshold: {data.get('tilt_over_threshold', False)}")
         print(f"  Duration: {data.get('tilt_duration_ms', 0)} ms")
         print(f"  Button Pressed: {data.get('button_pressed', False)}")
-        print(f"  WiFi RSSI: {data.get('wifi_rssi', 0)} dBm")
         
         # Determine alert level based on tilt angle
         tilt = data.get('tilt_angle', 0)
@@ -48,7 +64,7 @@ def receive_sensor_data():
         # Build response
         response = {
             "visual_score": 0.0,
-            "alert_level": "OK",
+            "alert_level": 0,
             "motor_on": False,
             "buzzer_on": False,
             "red_led": False,
@@ -64,7 +80,7 @@ def receive_sensor_data():
         # Check tilt thresholds
         if tilt >= TILT_CRITICAL_THRESHOLD:
             response.update({
-                "alert_level": "Level 2",
+                "alert_level": 2,
                 "motor_on": True,
                 "buzzer_on": True,
                 "red_led": True,
@@ -76,7 +92,7 @@ def receive_sensor_data():
             
         elif tilt >= TILT_ALERT_THRESHOLD:
             response.update({
-                "alert_level": "Level 1",
+                "alert_level": 1,
                 "motor_on": True,
                 "buzzer_on": True,
                 "red_led": True,

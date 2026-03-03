@@ -1,101 +1,74 @@
 /**
  * ============================================================================
- *  Driver Drowsiness Detection System
- *  Arduino + ESP-01 (AT firmware) Firmware
+ *  Driver Drowsiness Detection System — Arduino Sensor Controller
  *
  *  Architecture
  *  ─────────────────────────────────────────────────────────────────────────
  *  Arduino Uno → main controller
- *    • reads  MPU6050 head-tilt sensor (I2C)
+ *    • reads  MPU6050 head-tilt sensor (I2C on A4/A5)
  *    • reads  push button
- *    • drives green LED, red LED, vibration motor (NPN transistor), buzzer
- *    • builds JSON payloads and hands them to the ESP module
+ *    • drives green LED, red LED, vibration motor, buzzer
+ *    • sends JSON sensor data over Serial to NodeMCU every 1 second
+ *    • receives JSON alert commands back from NodeMCU
  *
- *  ESP-01 module → Wi-Fi co-processor only
- *    • communicates with Arduino over SoftwareSerial using AT commands
- *    • no custom firmware required — stock AT firmware is assumed
+ *  NodeMCU (ESP8266) → Wi-Fi bridge
+ *    • receives JSON from Arduino over Serial
+ *    • POSTs it to the Python server via HTTP
+ *    • returns the server response back over Serial
+ *    • sends WIFI_OK / WIFI_FAIL status messages
  *
- *  Python server (laptop) → receives POST /sensor every second, returns JSON
- *
- *  MPU6050 library: jrowberg/I2Cdevlib-MPU6050  (see platformio.ini)
+ *  Python server (laptop) → receives POST /sensor, returns alert JSON
  *
  *  Pin map
  *  ─────────────────────────────────────────────────────────────────────────
  *  MPU6050  SDA  → A4
  *  MPU6050  SCL  → A5
- *  ESP-01   RX  ← Arduino D3  (TX)   ⚠ see voltage-divider warning below
- *  ESP-01   TX  → Arduino D2  (RX)
+ *  NodeMCU  RX   ← Arduino TX (pin 1) via voltage divider (5V→3.3V)
+ *  NodeMCU  TX   → Arduino RX (pin 0)
  *  Button        → D4   (INPUT_PULLUP, press = LOW)
  *  Vibration     → D5   (NPN transistor base via resistor)
- *  Buzzer        → D6   (passive, PWM or digital toggle)
+ *  Buzzer        → D6   (passive buzzer)
  *  Red LED       → D7
  *  Green LED     → D8
  *
- *  ⚠  VOLTAGE WARNING
- *  ─────────────────────────────────────────────────────────────────────────
- *  The Arduino Uno operates at 5 V logic.
- *  The ESP-01 RX pin is rated for 3.3 V maximum.
- *  You MUST use a voltage divider or logic-level shifter on the wire that
- *  runs from Arduino D3 (TX) to ESP-01 RX.
- *  A simple 1 kΩ + 2 kΩ resistor divider works:
- *      Arduino D3 ──[1kΩ]──┬── ESP RX
- *                        [2kΩ]
- *                          │
- *                         GND
- *  The Arduino RX (D2) receiving from ESP TX (3.3 V) is fine — 3.3 V logic
- *  HIGH is recognised as HIGH by a 5 V AVR, no shifter needed on that side.
+ *  ⚠  UPLOAD WARNING — Disconnect NodeMCU wires from pins 0/1 before
+ *     uploading, reconnect after upload completes.
  * ============================================================================
  */
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <SoftwareSerial.h>
 #include <MPU6050.h>           // jrowberg/I2Cdevlib-MPU6050
 
 
 // ============================================================================
-//  CONFIGURATION — change these constants to match your environment
+//  CONFIGURATION
 // ============================================================================
-
-// Wi-Fi credentials
-const char* WIFI_SSID     = "ZTE_5G_ni2RJ9";
-const char* WIFI_PASSWORD = "AHdgjiAg";
-
-// Python server — laptop local IP, port 5000, path /sensor
-const char* SERVER_HOST = "192.168.1.21";
-const int   SERVER_PORT = 5000;
-const char* SERVER_PATH = "/sensor";
 
 // Device identification sent in every payload
 const char* DEVICE_ID = "ARD_DROWSINESS_001";
 
 // Timing intervals (milliseconds)
-const unsigned long SEND_INTERVAL          = 1000;   // POST every 1 s
-const unsigned long WIFI_RETRY_INTERVAL    = 10000;  // retry Wi-Fi every 10 s
-const unsigned long MPU_READ_INTERVAL      = 100;    // sample MPU every 100 ms
-const unsigned long AT_SHORT_TIMEOUT_MS    = 2000;   // short AT command timeout
-const unsigned long AT_CWJAP_TIMEOUT_MS    = 15000;  // Wi-Fi join timeout
-const unsigned long AT_TCP_TIMEOUT_MS      = 5000;   // TCP connect / send timeout
+const unsigned long SEND_INTERVAL       = 1000;   // send JSON every 1 s
+const unsigned long MPU_READ_INTERVAL   = 100;    // sample MPU every 100 ms
 
 // Tilt thresholds
-const float         TILT_THRESHOLD_DEG        = 30.0;   // degrees
-const unsigned long TILT_DURATION_MS_ALERT    = 3000;   // 3 s → local alert candidate
+const float         TILT_THRESHOLD_DEG     = 30.0;   // degrees
+const unsigned long TILT_DURATION_MS_ALERT = 3000;   // 3 s → local fallback
 
 // Alert output timing
 const unsigned long BUZZER_TOGGLE_INTERVAL = 500;   // buzzer beep period
 const unsigned long LED_BLINK_INTERVAL     = 250;   // red LED blink period
 
-// ESP baud rate — must match the AT firmware baud rate on your module
-const long ESP_BAUD = 115200;
+// Serial baud — must match NodeMCU firmware
+const long SERIAL_BAUD = 115200;
 
 
 // ============================================================================
 //  PIN DEFINITIONS
 // ============================================================================
 
-// SoftwareSerial for ESP-01 AT communication
-const uint8_t ESP_RX_PIN = 2;   // Arduino D2  ← ESP TX
-const uint8_t ESP_TX_PIN = 3;   // Arduino D3  → ESP RX  (USE VOLTAGE DIVIDER!)
+// NodeMCU uses hardware Serial (pins 0 RX / 1 TX)
 
 // Inputs
 const uint8_t BUTTON_PIN = 4;   // D4, INPUT_PULLUP
@@ -111,8 +84,8 @@ const uint8_t GREEN_LED_PIN = 8;  // D8
 //  OBJECTS
 // ============================================================================
 
-SoftwareSerial espSerial(ESP_RX_PIN, ESP_TX_PIN);
-MPU6050        mpu;
+MPU6050  mpu;           // default address 0x68; initMPU() also tries 0x69
+bool     mpu_addr_tried_69 = false;
 
 
 // ============================================================================
@@ -131,10 +104,11 @@ unsigned long tilt_start_time     = 0;
 unsigned long tilt_duration_ms    = 0;
 
 // Button
-bool          button_pressed     = false;
-bool          button_last_state  = HIGH;
-unsigned long button_debounce_ts = 0;
-const unsigned long DEBOUNCE_DELAY = 50;
+bool          button_pressed        = false;
+bool          button_last_state     = HIGH;
+bool          button_debounced_state = HIGH;   // tracks the stable state
+unsigned long button_debounce_ts    = 0;
+const unsigned long DEBOUNCE_DELAY  = 50;
 
 // Alert state (set by server response or local fallback)
 bool   motor_on     = false;
@@ -147,8 +121,7 @@ int    alert_level  = 0;        // 0=OK  1=Level1  2=Level2/MAX
 // Local fallback flag
 bool local_alert_active = false;
 
-// ESP / Wi-Fi state
-bool esp_ready      = false;
+// Wi-Fi status (reported by NodeMCU)
 bool wifi_connected = false;
 
 // Output toggle state
@@ -159,8 +132,11 @@ unsigned long last_led_blink      = 0;
 
 // Timing
 unsigned long last_send_time     = 0;
-unsigned long last_wifi_retry    = 0;
 unsigned long last_mpu_read      = 0;
+
+// Serial receive buffer
+char   rx_buf[512];
+int    rx_pos = 0;
 
 
 // ============================================================================
@@ -180,15 +156,10 @@ void updateLocalAlertState();
 void applyOutputs();
 void silenceAlerts();
 
-// ESP / AT
-bool   sendATCommand(const char* cmd, const char* expected,
-                     unsigned long timeout_ms);
-String waitForResponse(unsigned long timeout_ms);
-bool   connectESP();
-bool   connectWiFi();
-void   buildJsonPayload(char* buf, size_t buf_size);
-bool   sendHttpPost();
-void   parseServerReply(const String& reply);
+// Communication
+void sendSensorData();
+void checkSerial();
+void parseResponse(const char* line);
 
 
 // ============================================================================
@@ -196,11 +167,8 @@ void   parseServerReply(const String& reply);
 // ============================================================================
 
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD);
     delay(200);
-    Serial.println(F("\n========================================"));
-    Serial.println(F(" Drowsiness Detection — Arduino + ESP-01"));
-    Serial.println(F("========================================\n"));
 
     // Output pins
     pinMode(VIBRATION_PIN, OUTPUT);
@@ -215,27 +183,15 @@ void setup() {
     // Input pin
     pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-    Serial.println(F("[INIT] GPIO configured"));
-
     // I2C for MPU6050
     Wire.begin();
-    Serial.println(F("[INIT] I2C started"));
+
+    // Wait for NodeMCU to boot and connect to Wi-Fi before sending any serial
+    // data — prevents boot interference on the shared UART line.
+    delay(20000);
 
     // MPU6050
     initMPU();
-
-    // SoftwareSerial for ESP-01
-    espSerial.begin(ESP_BAUD);
-    delay(300);
-    Serial.println(F("[INIT] SoftwareSerial started for ESP-01"));
-
-    // Bring ESP up and connect to Wi-Fi
-    esp_ready = connectESP();
-    if (esp_ready) {
-        wifi_connected = connectWiFi();
-    }
-
-    Serial.println(F("\n[READY] Entering main loop\n"));
 }
 
 
@@ -246,45 +202,29 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // ── Read MPU6050 ────────────────────────────────────────────────────────
+    // ── Read incoming data from NodeMCU ─────────────────────────────────
+    checkSerial();
+
+    // ── Read MPU6050 ────────────────────────────────────────────────────
     if (mpu_initialized && (now - last_mpu_read >= MPU_READ_INTERVAL)) {
         current_tilt_angle = readTiltAngle();
         last_mpu_read = now;
     }
 
-    // ── Read button ─────────────────────────────────────────────────────────
+    // ── Read button ─────────────────────────────────────────────────────
     readButton();
 
-    // ── Update local alert candidate ────────────────────────────────────────
+    // ── Update local alert candidate ────────────────────────────────────
     updateLocalAlertState();
 
-    // ── Periodic HTTP POST ──────────────────────────────────────────────────
+    // ── Send sensor data every SEND_INTERVAL ────────────────────────────
     if (now - last_send_time >= SEND_INTERVAL) {
         last_send_time = now;
-
-        if (!wifi_connected && esp_ready &&
-            (now - last_wifi_retry >= WIFI_RETRY_INTERVAL)) {
-            Serial.println(F("[WIFI] Attempting reconnect..."));
-            wifi_connected = connectWiFi();
-            last_wifi_retry = now;
-        }
-
-        if (wifi_connected) {
-            bool ok = sendHttpPost();
-            if (!ok) {
-                Serial.println(F("[HTTP] POST failed — will retry next cycle"));
-                wifi_connected = false;   // probe connection next interval
-            }
-        } else {
-            Serial.println(F("[HTTP] Skipped — no Wi-Fi"));
-        }
+        sendSensorData();
     }
 
-    // ── Apply outputs (non-blocking PWM/blink/beep) ─────────────────────────
+    // ── Apply outputs (non-blocking blink/beep) ─────────────────────────
     applyOutputs();
-
-    // Yield to keep the watchdog happy
-    yield();
 }
 
 
@@ -298,18 +238,15 @@ void loop() {
  * detection is disabled — the rest of the system still operates.
  */
 void initMPU() {
-    Serial.print(F("[MPU] Initialising..."));
+    // Try default I2C address 0x68 first (AD0 = LOW / floating-low)
+    mpu = MPU6050(0x68);
     mpu.initialize();
 
-    if (!mpu.testConnection()) {
-        Serial.println(F(" FAILED — check SDA/SCL wiring!"));
-        mpu_initialized = false;
-        return;
-    }
-
-    Serial.println(F(" OK"));
+    // testConnection() fails on many clone MPU6050 boards even when the sensor
+    // is wired correctly — skip it and check if readings are non-zero instead.
+    // If the sensor truly isn't present, readings will stay at 0 and tilt
+    // detection simply won't trigger.
     mpu_initialized = true;
-
     mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
     mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
 
@@ -324,8 +261,6 @@ void initMPU() {
 void calibrateNeutralPosition() {
     if (!mpu_initialized) return;
 
-    Serial.print(F("[MPU] Calibrating neutral position"));
-
     long sum_ax = 0, sum_ay = 0, sum_az = 0;
     const int SAMPLES = 50;
 
@@ -336,21 +271,12 @@ void calibrateNeutralPosition() {
         sum_ay += ay;
         sum_az += az;
         delay(10);
-        if (i % 10 == 0) Serial.print('.');
     }
 
     neutral_ax = (int16_t)(sum_ax / SAMPLES);
     neutral_ay = (int16_t)(sum_ay / SAMPLES);
     neutral_az = (int16_t)(sum_az / SAMPLES);
     mpu_calibrated = true;
-
-    Serial.println(F(" done"));
-    Serial.print(F("[MPU] Neutral — ax:"));
-    Serial.print(neutral_ax);
-    Serial.print(F("  ay:"));
-    Serial.print(neutral_ay);
-    Serial.print(F("  az:"));
-    Serial.println(neutral_az);
 }
 
 /**
@@ -394,11 +320,14 @@ void readButton() {
     }
 
     if ((now - button_debounce_ts) > DEBOUNCE_DELAY) {
-        if (cur == LOW && button_last_state == HIGH) {
-            // Falling edge — button just pressed
-            button_pressed = true;
-            Serial.println(F("[BTN] Pressed — silencing alerts"));
-            silenceAlerts();
+        // The reading has been stable longer than the debounce period
+        if (cur != button_debounced_state) {
+            button_debounced_state = cur;
+            if (cur == LOW) {
+                // Falling edge — button just pressed
+                button_pressed = true;
+                silenceAlerts();
+            }
         }
     }
 
@@ -424,11 +353,6 @@ void updateLocalAlertState() {
         if (!tilt_over_threshold) {
             tilt_over_threshold = true;
             tilt_start_time     = now;
-            Serial.print(F("[TILT] Exceeded threshold: "));
-            Serial.print(current_tilt_angle, 1);
-            Serial.print(F("° > "));
-            Serial.print(TILT_THRESHOLD_DEG, 1);
-            Serial.println('°');
         }
         tilt_duration_ms = now - tilt_start_time;
 
@@ -441,14 +365,8 @@ void updateLocalAlertState() {
             buzzer_on   = true;
             red_led_on  = true;
             green_led_on = false;
-            Serial.println(F("[ALERT] Local fallback triggered!"));
         }
     } else {
-        if (tilt_over_threshold) {
-            Serial.print(F("[TILT] Returned to normal: "));
-            Serial.print(current_tilt_angle, 1);
-            Serial.println('°');
-        }
         tilt_over_threshold = false;
         tilt_duration_ms    = 0;
         tilt_start_time     = 0;
@@ -465,22 +383,35 @@ void updateLocalAlertState() {
 void applyOutputs() {
     unsigned long now = millis();
 
-    // Vibration motor
-    digitalWrite(VIBRATION_PIN, motor_on ? HIGH : LOW);
+    // Shared toggle timer — buzzer and motor pulse together in sync
+    if ((buzzer_on || motor_on) &&
+        (now - last_buzzer_toggle >= BUZZER_TOGGLE_INTERVAL)) {
+        buzzer_state = !buzzer_state;
+        last_buzzer_toggle = now;
+    }
+    if (!buzzer_on && !motor_on) {
+        buzzer_state = false;
+    }
+
+    // Vibration motor — continuous when alone, pulse in sync with buzzer during alerts
+    if (motor_on) {
+        if (buzzer_on) {
+            digitalWrite(VIBRATION_PIN, buzzer_state ? HIGH : LOW);
+        } else {
+            digitalWrite(VIBRATION_PIN, HIGH);   // continuous (test mode)
+        }
+    } else {
+        digitalWrite(VIBRATION_PIN, LOW);
+    }
 
     // Green LED
     digitalWrite(GREEN_LED_PIN, green_led_on ? HIGH : LOW);
 
-    // Buzzer (beeping)
+    // Buzzer (beeping in sync with motor)
     if (buzzer_on) {
-        if (now - last_buzzer_toggle >= BUZZER_TOGGLE_INTERVAL) {
-            buzzer_state = !buzzer_state;
-            digitalWrite(BUZZER_PIN, buzzer_state ? HIGH : LOW);
-            last_buzzer_toggle = now;
-        }
+        digitalWrite(BUZZER_PIN, buzzer_state ? HIGH : LOW);
     } else {
         digitalWrite(BUZZER_PIN, LOW);
-        buzzer_state = false;
     }
 
     // Red LED (solid = critical, blink = level 1)
@@ -520,284 +451,102 @@ void silenceAlerts() {
     digitalWrite(BUZZER_PIN,    LOW);
     digitalWrite(RED_LED_PIN,   LOW);
     digitalWrite(GREEN_LED_PIN, HIGH);
-
-    Serial.println(F("[ALERT] Silenced"));
 }
 
 
 // ============================================================================
-//  ESP-01 AT HELPERS
+//  SERIAL COMMUNICATION WITH NODEMCU
 // ============================================================================
 
 /**
- * Send an AT command string to the ESP module and wait for an expected
- * response keyword (e.g. "OK", "CONNECT", "SEND OK").
- *
- * @param cmd       null-terminated command string  (e.g. "AT+CWMODE=1")
- * @param expected  substring to look for in the reply (e.g. "OK")
- * @param timeout_ms  how long to wait in milliseconds
- * @return true if the expected substring was found before timeout
- *
- * A trailing '\r\n' is appended automatically.
+ * Send sensor data as a JSON line to the NodeMCU.
+ * The NodeMCU will POST it to the server and return a response.
  */
-bool sendATCommand(const char* cmd, const char* expected,
-                   unsigned long timeout_ms) {
-    // Flush any pending data
-    while (espSerial.available()) espSerial.read();
-
-    Serial.print(F("[AT] >> "));
-    Serial.println(cmd);
-
-    espSerial.print(cmd);
-    espSerial.print(F("\r\n"));
-
-    String response = waitForResponse(timeout_ms);
-
-    Serial.print(F("[AT] << "));
-    Serial.println(response);
-
-    return response.indexOf(expected) != -1;
-}
-
-/**
- * Read all bytes from espSerial until timeout_ms elapses with no new data,
- * or the buffer overflows.  Returns the accumulated string.
- */
-String waitForResponse(unsigned long timeout_ms) {
-    String resp;
-    resp.reserve(256);
-    unsigned long start   = millis();
-    unsigned long last_rx = millis();
-
-    while (true) {
-        while (espSerial.available()) {
-            char c = (char)espSerial.read();
-            resp += c;
-            last_rx = millis();
-            if (resp.length() > 512) break;   // safety cap
-        }
-        // Done when we haven't received anything for 200 ms OR hard timeout
-        if ((millis() - last_rx > 200) && resp.length() > 0) break;
-        if (millis() - start > timeout_ms) break;
+void sendSensorData() {
+    // Build JSON manually (no heap alloc, safe for Uno)
+    // NOTE: AVR snprintf does NOT support %f — use dtostrf() first.
+    char tilt_str[12];
+    if (isnan(current_tilt_angle) || isinf(current_tilt_angle)) {
+        strcpy(tilt_str, "0.00");
+    } else {
+        dtostrf(current_tilt_angle, 1, 2, tilt_str);
     }
 
-    return resp;
-}
-
-/**
- * Wake the ESP module and put it into station mode.
- * Returns true if the module responds to AT and accepts CWMODE=1.
- */
-bool connectESP() {
-    Serial.println(F("[ESP] Initialising AT interface..."));
-
-    // Some modules need a moment after power-on
-    delay(1000);
-
-    // Clear garbage
-    while (espSerial.available()) espSerial.read();
-
-    // Test basic communication — try up to 3 times
-    for (int attempt = 1; attempt <= 3; attempt++) {
-        Serial.print(F("[ESP] AT test attempt "));
-        Serial.println(attempt);
-        if (sendATCommand("AT", "OK", AT_SHORT_TIMEOUT_MS)) {
-            Serial.println(F("[ESP] AT OK"));
-            break;
-        }
-        if (attempt == 3) {
-            Serial.println(F("[ESP] No response from ESP module! Check wiring."));
-            return false;
-        }
-        delay(500);
-    }
-
-    // Disable echo so responses are easier to parse
-    sendATCommand("ATE0", "OK", AT_SHORT_TIMEOUT_MS);
-
-    // Station mode (client)
-    if (!sendATCommand("AT+CWMODE=1", "OK", AT_SHORT_TIMEOUT_MS)) {
-        Serial.println(F("[ESP] Failed to set station mode"));
-        return false;
-    }
-
-    Serial.println(F("[ESP] Ready — station mode set"));
-    return true;
-}
-
-/**
- * Join the Wi-Fi network.
- * Returns true if CWJAP reports "WIFI GOT IP" within the timeout.
- */
-bool connectWiFi() {
-    Serial.print(F("[WIFI] Connecting to "));
-    Serial.println(WIFI_SSID);
-
-    // Build the AT+CWJAP command string dynamically
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"",
-             WIFI_SSID, WIFI_PASSWORD);
-
-    if (!sendATCommand(cmd, "WIFI GOT IP", AT_CWJAP_TIMEOUT_MS)) {
-        Serial.println(F("[WIFI] Connection failed"));
-        return false;
-    }
-
-    Serial.println(F("[WIFI] Connected!"));
-    return true;
-}
-
-
-// ============================================================================
-//  HTTP POST VIA AT COMMANDS
-// ============================================================================
-
-/**
- * Build the JSON payload into the caller-supplied buffer.
- * Manual string construction — no heap allocation, safe on Uno.
- */
-void buildJsonPayload(char* buf, size_t buf_size) {
-    // tilt_duration_ms as integer, tilt_angle with 2 decimal places
-    snprintf(buf, buf_size,
+    char buf[256];
+    snprintf(buf, sizeof(buf),
         "{"
         "\"device_id\":\"%s\","
-        "\"tilt_angle\":%.2f,"
+        "\"tilt_angle\":%s,"
         "\"tilt_over_threshold\":%s,"
         "\"tilt_duration_ms\":%lu,"
         "\"button_pressed\":%s,"
         "\"local_alert_candidate\":%s"
         "}",
         DEVICE_ID,
-        current_tilt_angle,
+        tilt_str,
         tilt_over_threshold  ? "true" : "false",
         tilt_duration_ms,
         button_pressed       ? "true" : "false",
         local_alert_active   ? "true" : "false"
     );
-}
+    Serial.println(buf);
 
-/**
- * Open a TCP connection to the Python server, send an HTTP POST request
- * containing the JSON payload, read the response, then close the connection.
- *
- * Returns true if the response was received (even partial); false on error.
- *
- * AT command sequence used:
- *   1. AT+CIPSTART="TCP","<host>",<port>   — open TCP socket
- *   2. AT+CIPSEND=<byte_count>             — tell ESP how many bytes follow
- *   3. <raw HTTP request>                  — send the actual data
- *   4. AT+CIPCLOSE                         — close socket
- */
-bool sendHttpPost() {
-    // ── 1. Build JSON payload ────────────────────────────────────────────
-    char json_body[256];
-    buildJsonPayload(json_body, sizeof(json_body));
-    int body_len = strlen(json_body);
-
-    // ── 2. Build the full HTTP request ───────────────────────────────────
-    //    We need the exact byte length before sending AT+CIPSEND.
-    char http_req[384];
-    int req_len = snprintf(http_req, sizeof(http_req),
-        "POST %s HTTP/1.1\r\n"
-        "Host: %s:%d\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %d\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-        "%s",
-        SERVER_PATH,
-        SERVER_HOST, SERVER_PORT,
-        body_len,
-        json_body
-    );
-
-    if (req_len <= 0 || (size_t)req_len >= sizeof(http_req)) {
-        Serial.println(F("[HTTP] Request buffer too small!"));
-        return false;
-    }
-
-    // ── 3. AT+CIPSTART — open TCP socket ─────────────────────────────────
-    char cipstart_cmd[80];
-    snprintf(cipstart_cmd, sizeof(cipstart_cmd),
-             "AT+CIPSTART=\"TCP\",\"%s\",%d", SERVER_HOST, SERVER_PORT);
-
-    Serial.println(F("[HTTP] Opening TCP connection..."));
-    if (!sendATCommand(cipstart_cmd, "CONNECT", AT_TCP_TIMEOUT_MS)) {
-        Serial.println(F("[HTTP] TCP CIPSTART failed"));
-        // Module may already have an open connection — close it and return
-        sendATCommand("AT+CIPCLOSE", "OK", AT_SHORT_TIMEOUT_MS);
-        return false;
-    }
-
-    // ── 4. AT+CIPSEND — declare byte count ───────────────────────────────
-    char cipsend_cmd[32];
-    snprintf(cipsend_cmd, sizeof(cipsend_cmd), "AT+CIPSEND=%d", req_len);
-
-    if (!sendATCommand(cipsend_cmd, ">", AT_TCP_TIMEOUT_MS)) {
-        Serial.println(F("[HTTP] CIPSEND prompt not received"));
-        sendATCommand("AT+CIPCLOSE", "OK", AT_SHORT_TIMEOUT_MS);
-        return false;
-    }
-
-    // ── 5. Write raw HTTP request bytes ──────────────────────────────────
-    Serial.println(F("[HTTP] Sending request body..."));
-    espSerial.print(http_req);
-
-    // Wait for ESP to confirm the data was delivered
-    String send_response = waitForResponse(AT_TCP_TIMEOUT_MS);
-    Serial.print(F("[HTTP] SEND response: "));
-    Serial.println(send_response);
-
-    if (send_response.indexOf("SEND OK") == -1) {
-        Serial.println(F("[HTTP] Data send failed"));
-        sendATCommand("AT+CIPCLOSE", "OK", AT_SHORT_TIMEOUT_MS);
-        return false;
-    }
-
-    // ── 6. Read the HTTP response ─────────────────────────────────────────
-    //    The server will send the response and then close the connection
-    //    (Connection: close).  We collect data for up to AT_TCP_TIMEOUT_MS.
-    Serial.println(F("[HTTP] Waiting for server response..."));
-    String server_reply = waitForResponse(AT_TCP_TIMEOUT_MS);
-    Serial.print(F("[HTTP] Reply: "));
-    Serial.println(server_reply);
-
-    // ── 7. Parse reply ────────────────────────────────────────────────────
-    if (server_reply.length() > 0) {
-        parseServerReply(server_reply);
-    }
-
-    // ── 8. AT+CIPCLOSE ────────────────────────────────────────────────────
-    sendATCommand("AT+CIPCLOSE", "OK", AT_SHORT_TIMEOUT_MS);
-
-    // Reset button flag after a successful send
+    // Reset button flag after sending
     button_pressed = false;
-
-    return true;
 }
 
-
-// ============================================================================
-//  RESPONSE PARSING
-// ============================================================================
+/**
+ * Check for incoming serial data from NodeMCU.
+ * Reads one line at a time and dispatches to parseResponse().
+ */
+void checkSerial() {
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (rx_pos > 0) {
+                rx_buf[rx_pos] = '\0';
+                parseResponse(rx_buf);
+                rx_pos = 0;
+            }
+        } else {
+            if (rx_pos < (int)sizeof(rx_buf) - 1) {
+                rx_buf[rx_pos++] = c;
+            } else {
+                rx_pos = 0;  // overflow — discard
+            }
+        }
+    }
+}
 
 /**
- * Scan the raw HTTP response text for known JSON keywords and update the
- * alert output variables accordingly.
- *
- * This avoids a full JSON parser (too heavy for Uno's 2 KB SRAM).
- * It looks for exact substrings expected from the Python server, e.g.:
- *   "alert_level":1  "motor_on":true  "buzzer_on":false  etc.
- *
- * The approach is robust enough for a controlled private protocol where the
- * key names are known in advance.
+ * Parse a line received from NodeMCU.
+ * Could be:
+ *   - "WIFI_OK"   → Wi-Fi connected
+ *   - "WIFI_FAIL" → Wi-Fi disconnected
+ *   - "HTTP_FAIL" → POST failed
+ *   - JSON object → server response
  */
-void parseServerReply(const String& reply) {
-    // ── alert_level ──────────────────────────────────────────────────────
+void parseResponse(const char* line) {
+    // Check status messages first
+    if (strncmp(line, "WIFI_OK", 7) == 0) {
+        wifi_connected = true;
+        return;
+    }
+    if (strncmp(line, "WIFI_FAIL", 9) == 0) {
+        wifi_connected = false;
+        return;
+    }
+    if (strncmp(line, "HTTP_FAIL", 9) == 0) {
+        return;  // nothing to do, will retry next cycle
+    }
+
+    // Must be a JSON response from the server — parse it
+    // Uses substring matching (no JSON library needed on Uno)
+    String reply(line);
+
+    // alert_level
     if (reply.indexOf(F("\"alert_level\":2")) != -1 ||
-        reply.indexOf(F("\"alert_level\": 2")) != -1 ||
-        reply.indexOf(F("\"alert_level\":\"MAX\"")) != -1 ||
-        reply.indexOf(F("\"alert_level\": \"MAX\"")) != -1) {
+        reply.indexOf(F("\"alert_level\": 2")) != -1) {
         alert_level = 2;
     } else if (reply.indexOf(F("\"alert_level\":1")) != -1 ||
                reply.indexOf(F("\"alert_level\": 1")) != -1) {
@@ -806,52 +555,42 @@ void parseServerReply(const String& reply) {
         alert_level = 0;
     }
 
-    // ── motor_on ─────────────────────────────────────────────────────────
-    if (reply.indexOf(F("\"motor_on\":true")) != -1 ||
-        reply.indexOf(F("\"motor_on\": true")) != -1) {
+    // motor_on
+    if (reply.indexOf(F("\"motor_on\": true")) != -1 ||
+        reply.indexOf(F("\"motor_on\":true")) != -1) {
         motor_on = true;
-    } else if (reply.indexOf(F("\"motor_on\":false")) != -1 ||
-               reply.indexOf(F("\"motor_on\": false")) != -1) {
+    } else {
         motor_on = false;
     }
 
-    // ── buzzer_on ─────────────────────────────────────────────────────────
-    if (reply.indexOf(F("\"buzzer_on\":true")) != -1 ||
-        reply.indexOf(F("\"buzzer_on\": true")) != -1) {
+    // buzzer_on
+    if (reply.indexOf(F("\"buzzer_on\": true")) != -1 ||
+        reply.indexOf(F("\"buzzer_on\":true")) != -1) {
         buzzer_on = true;
-    } else if (reply.indexOf(F("\"buzzer_on\":false")) != -1 ||
-               reply.indexOf(F("\"buzzer_on\": false")) != -1) {
+    } else {
         buzzer_on = false;
     }
 
-    // ── red_led ───────────────────────────────────────────────────────────
-    if (reply.indexOf(F("\"red_led\":true")) != -1 ||
-        reply.indexOf(F("\"red_led\": true")) != -1) {
+    // red_led
+    if (reply.indexOf(F("\"red_led\": true")) != -1 ||
+        reply.indexOf(F("\"red_led\":true")) != -1) {
         red_led_on = true;
-    } else if (reply.indexOf(F("\"red_led\":false")) != -1 ||
-               reply.indexOf(F("\"red_led\": false")) != -1) {
+    } else {
         red_led_on = false;
     }
 
-    // ── green_led ─────────────────────────────────────────────────────────
-    if (reply.indexOf(F("\"green_led\":false")) != -1 ||
-        reply.indexOf(F("\"green_led\": false")) != -1) {
-        green_led_on = false;
-    } else if (reply.indexOf(F("\"green_led\":true")) != -1 ||
-               reply.indexOf(F("\"green_led\": true")) != -1) {
+    // green_led
+    if (reply.indexOf(F("\"green_led\": true")) != -1 ||
+        reply.indexOf(F("\"green_led\":true")) != -1) {
         green_led_on = true;
+    } else {
+        green_led_on = false;
     }
 
-    // ── ack_required ──────────────────────────────────────────────────────
-    ack_required = (reply.indexOf(F("\"ack_required\":true")) != -1 ||
-                    reply.indexOf(F("\"ack_required\": true")) != -1);
+    // ack_required
+    ack_required = (reply.indexOf(F("\"ack_required\": true")) != -1 ||
+                    reply.indexOf(F("\"ack_required\":true")) != -1);
 
-    Serial.print(F("[PARSE] alert_level="));
-    Serial.print(alert_level);
-    Serial.print(F("  motor="));
-    Serial.print(motor_on);
-    Serial.print(F("  buzzer="));
-    Serial.print(buzzer_on);
-    Serial.print(F("  red_led="));
-    Serial.println(red_led_on);
+    // Clear local fallback if server is now responding
+    local_alert_active = false;
 }

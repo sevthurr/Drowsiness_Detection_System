@@ -42,6 +42,7 @@ class SimulatorEngine(QObject):
         self._vibration_on: bool = False
         self._buzzer_on: bool = False
         self._alarm_playing: bool = False
+        self._ack_cooldown_s: float = 0.0  # grace period after acknowledge
 
     # ── public API ──────────────────────────────────────────────────
     def start(self):
@@ -101,6 +102,7 @@ class SimulatorEngine(QObject):
         self._vibration_on = False
         self._buzzer_on = False
         self._alarm_playing = False
+        self._ack_cooldown_s = 5.0  # 5-second grace: ignore tilt/eyes so alert can't immediately re-fire
         self._emit()
 
     # ── internals ───────────────────────────────────────────────────
@@ -115,6 +117,7 @@ class SimulatorEngine(QObject):
         self._vibration_on = False
         self._buzzer_on = False
         self._alarm_playing = False
+        self._ack_cooldown_s = 0.0
 
     def _th(self):
         """Return effective thresholds from settings."""
@@ -130,6 +133,14 @@ class SimulatorEngine(QObject):
     def _tick(self):
         dt = 0.1
         th = self._th()
+
+        # ── post-acknowledge cooldown ────────────────────────────
+        if self._ack_cooldown_s > 0:
+            self._ack_cooldown_s -= dt
+            self._tilt_over_s = 0.0
+            self._sim_eyes_s = 0.0
+            self._emit()
+            return
 
         # ── compute effective inputs ─────────────────────────────
         # Tilt

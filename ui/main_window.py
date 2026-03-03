@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 from core.event_log import EventLog
 from core.settings import Settings
 from core.simulator import SimulatorEngine
+from core.iot_server import IoTServer
 from camera.detector import CameraDetector
 from ui.theme import DARK, LIGHT, build_stylesheet
 from ui.widgets.top_bar import TopBar
@@ -37,6 +38,7 @@ class MainWindow(QMainWindow):
         self.event_log = EventLog()
         self.simulator = SimulatorEngine(self.settings, self.event_log)
         self.camera = CameraDetector()
+        self.iot_server = IoTServer(self.simulator, self.event_log)
 
         self._dark = self.settings.get("theme", "dark") == "dark"
         self._last_alert_level = "OK"
@@ -140,10 +142,21 @@ class MainWindow(QMainWindow):
         # Monitoring page camera toggle
         mp_.camera_toggled.connect(self._on_camera_toggle)
 
+        # Simulator engine → IoT server (MUST be before _on_alert_check so
+        # hardware gets buzzer_on/motor_on BEFORE the popup blocks the thread)
+        sim.state_updated.connect(self.iot_server.update_alert_state)
+
         # Simulator engine → UI
         sim.state_updated.connect(mp_.update_state)
         sim.state_updated.connect(self.top_bar.update_state)
         sim.state_updated.connect(self._on_alert_check)
+
+        # Physical button on device → GUI acknowledge
+        self.iot_server.hardware_button_pressed.connect(self._on_hardware_button)
+
+        # Start IoT server and simulator immediately so hardware works on launch
+        self.iot_server.start()
+        self._on_sim_start()
 
         # Event log → monitoring page
         log.entry_added.connect(mp_.add_log_entry)
@@ -185,6 +198,7 @@ class MainWindow(QMainWindow):
         """Reset alert state when simulation starts."""
         self._last_alert_level = "OK"
         self._alert_dialog_shown = False
+        self._active_alert_dialog = None   # reference so hardware button can close it
         self.simulator.start()
 
     def _on_sim_stop(self):
@@ -268,11 +282,14 @@ class MainWindow(QMainWindow):
             }}
         """)
         
+        self._active_alert_dialog = msg  # store so hardware button can close it
+        
         result = msg.exec()
-        if result == QMessageBox.StandardButton.Ok:
-            self.simulator.acknowledge()
-            self.event_log.add("Alarm acknowledged by user", "info")
-            self._alert_dialog_shown = False
+        # AcceptRole always triggers — acknowledge the alert
+        self.simulator.acknowledge()
+        self.event_log.add("Alarm acknowledged by user", "info")
+        self._alert_dialog_shown = False
+        self._active_alert_dialog = None
     # ── theme ───────────────────────────────────────────────────────
     def _on_theme(self, dark):
         self._dark = dark
@@ -291,24 +308,33 @@ class MainWindow(QMainWindow):
 
     def _test_buzz(self):
         hz = self.settings.get("buzzer_freq_hz", 2000)
-        self.event_log.add(f"Test buzzer at {hz} Hz", "info")
+        self.event_log.add(f"Test buzzer at {hz} Hz — activating hardware", "info")
         self.monitoring.show_actuator("buzz", f"Buzzer beep ({hz} Hz)", 2500)
+        self.iot_server.test_buzzer(duration_ms=2500)
 
     def _test_vib(self):
         f = self.settings.get("vibration_freq_l1", 2.0)
-        self.event_log.add(f"Test vibration at {f} p/s", "info")
+        self.event_log.add(f"Test vibration at {f} p/s — activating hardware", "info")
         self.monitoring.show_actuator("vib", f"Vibration ON ({f} p/s)", 2500)
+        self.iot_server.test_vibration(duration_ms=2500)
+
+    def _on_hardware_button(self):
+        """Physical button pressed on the Arduino device — acknowledge alert in GUI."""
+        self.event_log.add("Hardware button pressed \u2014 alert acknowledged", "info")
+        self._alert_dialog_shown = False
+        # Close the popup dialog if it is open
+        if self._active_alert_dialog is not None:
+            self._active_alert_dialog.accept()
+            self._active_alert_dialog = None
 
     def _test_alarm(self):
-        t = self.settings.get("alarm_track", 1)
-        v = self.settings.get("alarm_volume", 15)
-        self.event_log.add(f"Test alarm \u2014 track {t:03d}, vol {v}", "info")
-        self.monitoring.show_actuator(
-            "alarm", f"Alarm track {t:03d} playing (vol {v})", 2500
-        )
+        self.event_log.add("Test alarm \u2014 buzzer + vibration ON (2.5s)", "info")
+        self.monitoring.show_actuator("alarm", "Alarm: Buzzer + Vibration", 2500)
+        self.iot_server.test_both(duration_ms=2500)
 
     # ── cleanup ─────────────────────────────────────────────────────
     def closeEvent(self, event):
         self.camera.stop_capture()
         self.simulator.stop()
+        self.iot_server.stop()
         super().closeEvent(event)
