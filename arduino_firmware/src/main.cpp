@@ -39,6 +39,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPU6050.h>           // jrowberg/I2Cdevlib-MPU6050
+#include <avr/wdt.h>           // AVR watchdog timer — resets MCU on I2C hang
 
 
 // ============================================================================
@@ -135,7 +136,7 @@ unsigned long last_send_time     = 0;
 unsigned long last_mpu_read      = 0;
 
 // Serial receive buffer
-char   rx_buf[512];
+char   rx_buf[256];
 int    rx_pos = 0;
 
 
@@ -146,6 +147,7 @@ int    rx_pos = 0;
 // MPU6050
 void  initMPU();
 void  calibrateNeutralPosition();
+void  recoverI2C();
 float readTiltAngle();
 
 // Button
@@ -185,13 +187,20 @@ void setup() {
 
     // I2C for MPU6050
     Wire.begin();
+    Wire.setWireTimeout(25000, true);  // 25 ms I2C timeout, auto-reset TWI
 
     // Wait for NodeMCU to boot and connect to Wi-Fi before sending any serial
     // data — prevents boot interference on the shared UART line.
-    delay(20000);
+    for (int i = 0; i < 20; i++) {
+        delay(1000);
+    }
 
     // MPU6050
     initMPU();
+
+    // Enable watchdog timer (8 seconds).  If the I2C bus or any other
+    // subsystem hangs longer than this, the MCU resets automatically.
+    wdt_enable(WDTO_8S);
 }
 
 
@@ -200,6 +209,7 @@ void setup() {
 // ============================================================================
 
 void loop() {
+    wdt_reset();  // Pet the watchdog every iteration
     unsigned long now = millis();
 
     // ── Read incoming data from NodeMCU ─────────────────────────────────
@@ -271,6 +281,7 @@ void calibrateNeutralPosition() {
         sum_ay += ay;
         sum_az += az;
         delay(10);
+        wdt_reset();  // Keep watchdog alive during calibration
     }
 
     neutral_ax = (int16_t)(sum_ax / SAMPLES);
@@ -280,14 +291,51 @@ void calibrateNeutralPosition() {
 }
 
 /**
+ * Attempt to recover the I2C bus when SDA is stuck LOW.
+ * Bit-bangs up to 9 SCL pulses to free the slave, then re-inits Wire.
+ */
+void recoverI2C() {
+    // Disable TWI hardware
+    TWCR = 0;
+    pinMode(A5, OUTPUT);            // SCL
+    pinMode(A4, INPUT_PULLUP);      // SDA — read back
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(A5, LOW);
+        delayMicroseconds(5);
+        digitalWrite(A5, HIGH);
+        delayMicroseconds(5);
+        if (digitalRead(A4) == HIGH) break;   // SDA freed
+    }
+    Wire.begin();
+    Wire.setWireTimeout(25000, true);
+}
+
+/**
  * Compute the current head-tilt angle (degrees) relative to the calibrated
  * neutral position using accelerometer pitch.
+ *
+ * If the I2C bus is stuck (all-zero readings), attempts bus recovery
+ * and re-initialises the MPU6050.  Returns the last known good angle on
+ * unrecoverable failure.
  */
 float readTiltAngle() {
     if (!mpu_initialized || !mpu_calibrated) return 0.0f;
 
     int16_t ax, ay, az, gx, gy, gz;
     mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+    // Detect I2C lockup — all-zero readings
+    if (ax == 0 && ay == 0 && az == 0) {
+        recoverI2C();
+        mpu.initialize();
+        mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+        mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+        delay(10);
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        if (ax == 0 && ay == 0 && az == 0) {
+            return current_tilt_angle;  // keep last known value
+        }
+    }
 
     float pitch_now     = atan2((float)ax,
                                  sqrt((float)ay * ay + (float)az * az))
@@ -540,56 +588,23 @@ void parseResponse(const char* line) {
         return;  // nothing to do, will retry next cycle
     }
 
-    // Must be a JSON response from the server — parse it
-    // Uses substring matching (no JSON library needed on Uno)
-    String reply(line);
+    // Must be a JSON response from the server — parse it.
+    // Uses strstr() instead of String to avoid heap allocation on 2 KB RAM.
 
     // alert_level
-    if (reply.indexOf(F("\"alert_level\":2")) != -1 ||
-        reply.indexOf(F("\"alert_level\": 2")) != -1) {
+    if (strstr(line, "\"alert_level\":2") || strstr(line, "\"alert_level\": 2")) {
         alert_level = 2;
-    } else if (reply.indexOf(F("\"alert_level\":1")) != -1 ||
-               reply.indexOf(F("\"alert_level\": 1")) != -1) {
+    } else if (strstr(line, "\"alert_level\":1") || strstr(line, "\"alert_level\": 1")) {
         alert_level = 1;
     } else {
         alert_level = 0;
     }
 
-    // motor_on
-    if (reply.indexOf(F("\"motor_on\": true")) != -1 ||
-        reply.indexOf(F("\"motor_on\":true")) != -1) {
-        motor_on = true;
-    } else {
-        motor_on = false;
-    }
-
-    // buzzer_on
-    if (reply.indexOf(F("\"buzzer_on\": true")) != -1 ||
-        reply.indexOf(F("\"buzzer_on\":true")) != -1) {
-        buzzer_on = true;
-    } else {
-        buzzer_on = false;
-    }
-
-    // red_led
-    if (reply.indexOf(F("\"red_led\": true")) != -1 ||
-        reply.indexOf(F("\"red_led\":true")) != -1) {
-        red_led_on = true;
-    } else {
-        red_led_on = false;
-    }
-
-    // green_led
-    if (reply.indexOf(F("\"green_led\": true")) != -1 ||
-        reply.indexOf(F("\"green_led\":true")) != -1) {
-        green_led_on = true;
-    } else {
-        green_led_on = false;
-    }
-
-    // ack_required
-    ack_required = (reply.indexOf(F("\"ack_required\": true")) != -1 ||
-                    reply.indexOf(F("\"ack_required\":true")) != -1);
+    motor_on   = (strstr(line, "\"motor_on\":true")   || strstr(line, "\"motor_on\": true"));
+    buzzer_on  = (strstr(line, "\"buzzer_on\":true")  || strstr(line, "\"buzzer_on\": true"));
+    red_led_on = (strstr(line, "\"red_led\":true")    || strstr(line, "\"red_led\": true"));
+    green_led_on = (strstr(line, "\"green_led\":true") || strstr(line, "\"green_led\": true"));
+    ack_required = (strstr(line, "\"ack_required\":true") || strstr(line, "\"ack_required\": true"));
 
     // Clear local fallback if server is now responding
     local_alert_active = false;

@@ -6,7 +6,7 @@
   "vibration_freq_l1": 1.5,
   "vibration_freq_l2": 18.5,
   "alarm_track": 1,
-  "alarm_volume": 30,
+  "alarm_volume": 20,
   "tilt_threshold_deg": 15.0,
   "tilt_duration_s": 3.0,
   "eyes_closed_threshold_s": 2.0,
